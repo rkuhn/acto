@@ -1,4 +1,4 @@
-use crate::pod::Queue;
+use crate::pod::{MpQueue, Queue};
 use std::{
     cell::UnsafeCell,
     task::{Context, Poll},
@@ -16,8 +16,8 @@ impl<T> Default for MPSC<T> {
     }
 }
 
-impl<T> MPSC<T> {
-    pub fn enqueue(&self, message: T) -> bool {
+impl<T> MpQueue for MPSC<T> {
+    fn enqueue(&self, message: T) -> bool {
         self.tx.try_send(message).is_ok()
     }
 }
@@ -33,5 +33,9 @@ impl<T> Queue for MPSC<T> {
     fn poll(&self, context: &mut Context<'_>) -> Poll<Option<Self::Msg>> {
         let rx = unsafe { &mut *self.rx.get() };
         rx.poll_recv(context)
+    }
+
+    fn enqueue_mut(&self, message: T) -> bool {
+        self.enqueue(message)
     }
 }

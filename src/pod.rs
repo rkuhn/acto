@@ -4,11 +4,19 @@ use crate::ActorId;
 
 pub trait Queue {
     type Msg;
+
+    fn new() -> Self;
+
     // poll can only be called from one thread at a time, but adding `&mut` here
     // allows the implementation to assume exclusive access, which is usually not
     // the case due to the enqueue operation => force impl to use unsafe
     fn poll(&self, context: &mut Context<'_>) -> Poll<Option<Self::Msg>>;
-    fn new() -> Self;
+
+    fn enqueue_mut(&self, msg: Self::Msg) -> bool;
+}
+
+pub trait MpQueue: Queue {
+    fn enqueue(&self, msg: Self::Msg) -> bool;
 }
 
 pub(crate) struct Pod<T> {

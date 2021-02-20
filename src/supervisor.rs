@@ -1,18 +1,16 @@
-use crate::{MultiSender, SingleSender};
+use crate::pod::Queue;
 
 pub trait Supervisor<T>: Send + 'static {
     fn notify(self, result: T);
 }
 
-impl<T: Send + 'static> Supervisor<T> for MultiSender<T> {
-    fn notify(self, result: T) {
-        self.send(result);
-    }
-}
-
-impl<T: Send + 'static> Supervisor<T> for SingleSender<T> {
-    fn notify(mut self, result: T) {
-        self.send(result);
+impl<T> Supervisor<T::Msg> for crate::Sender<T>
+where
+    T: Queue + Send + 'static,
+    T::Msg: Send + 'static,
+{
+    fn notify(mut self, result: T::Msg) {
+        self.send_mut(result);
     }
 }
 

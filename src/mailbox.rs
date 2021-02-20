@@ -7,9 +7,8 @@ use std::{
 };
 
 use crate::{
-    mpsc::MPSC,
-    pod::{Pod, Queue},
-    MultiSender,
+    pod::{MpQueue, Pod, Queue},
+    sender::Sender,
 };
 
 #[derive(Debug, Display, Error)]
@@ -30,11 +29,9 @@ impl<T: Queue> Mailbox<T> {
     }
 }
 
-impl<Msg> Mailbox<MPSC<Msg>> {
-    pub fn me(&self) -> MultiSender<Msg> {
-        MultiSender {
-            pod: self.pod.clone(),
-        }
+impl<T: MpQueue> Mailbox<T> {
+    pub fn me(&self) -> Sender<T> {
+        Sender::new(self.pod.clone())
     }
 }
 

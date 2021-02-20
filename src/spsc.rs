@@ -16,13 +16,6 @@ impl<T> Default for SPSC<T> {
     }
 }
 
-impl<T> SPSC<T> {
-    pub fn enqueue(&self, message: T) -> bool {
-        let tx = unsafe { &mut *self.tx.get() };
-        tx.try_send(message).is_ok()
-    }
-}
-
 impl<T> Queue for SPSC<T> {
     type Msg = T;
 
@@ -37,5 +30,10 @@ impl<T> Queue for SPSC<T> {
     fn poll(&self, context: &mut Context<'_>) -> Poll<Option<Self::Msg>> {
         let rx = unsafe { &mut *self.rx.get() };
         rx.poll_recv(context)
+    }
+
+    fn enqueue_mut(&self, message: T) -> bool {
+        let tx = unsafe { &mut *self.tx.get() };
+        tx.try_send(message).is_ok()
     }
 }

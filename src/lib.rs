@@ -4,82 +4,52 @@
 //!
 //! Please check out [the example](https://github.com/Actyx/actor/blob/master/examples/pingpong.rs)
 
-use std::{future::Future, sync::Arc};
+use std::{future::Future, marker::PhantomData, sync::Arc};
 
 mod actor_id;
 mod mailbox;
 mod mpsc;
 mod pod;
 mod sender;
+pub mod spawn;
 mod spsc;
 mod supervisor;
 
 pub use actor_id::ActorId;
 pub use mailbox::{Mailbox, SenderGone};
 pub use mpsc::MPSC;
-pub use sender::{AnySender, MultiSender, SingleSender};
+pub use pod::{MpQueue, Queue};
+pub use sender::{DynSender, Sender};
 pub use spsc::SPSC;
 pub use supervisor::Supervisor;
 
-use pod::Pod;
+pub struct Actor<RT, A, Fut, Msg, S>(
+    PhantomData<RT>,
+    PhantomData<A>,
+    PhantomData<Fut>,
+    PhantomData<Msg>,
+    PhantomData<S>,
+);
 
-pub trait Spawn {
-    fn spawn<F>(&self, f: F)
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static;
-}
-impl Spawn for tokio::runtime::Runtime {
-    fn spawn<F>(&self, f: F)
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn(f);
-    }
-}
-impl Spawn for tokio::runtime::Handle {
-    fn spawn<F>(&self, f: F)
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn(f);
-    }
-}
-
-pub fn spawn_actor<RT, A, Fut, Msg, S>(rt: &RT, actor: A, supervisor: S) -> MultiSender<Msg>
+impl<RT, A, Fut, Msg, S> Actor<RT, A, Fut, Msg, S>
 where
-    RT: Spawn,
+    RT: spawn::Spawn,
     Msg: Send,
-    A: FnOnce(Mailbox<MPSC<Msg>>) -> Fut,
     Fut: Future + Send + 'static,
     S: Supervisor<Fut::Output>,
 {
-    let pod = Arc::new(Pod::new());
-    let fut = actor(Mailbox::new(pod.clone()));
-    let fut = async {
-        let result = fut.await;
-        supervisor.notify(result);
-    };
-    rt.spawn(fut);
-    MultiSender { pod }
-}
-
-pub fn spawn_actor_spsc<RT, A, Fut, Msg, S>(rt: &RT, actor: A, supervisor: S) -> SingleSender<Msg>
-where
-    RT: Spawn,
-    Msg: Send,
-    A: FnOnce(Mailbox<SPSC<Msg>>) -> Fut,
-    Fut: Future + Send + 'static,
-    S: Supervisor<Fut::Output>,
-{
-    let pod = Arc::new(Pod::new());
-    let fut = actor(Mailbox::new(pod.clone()));
-    let fut = async {
-        let result = fut.await;
-        supervisor.notify(result);
-    };
-    rt.spawn(fut);
-    SingleSender { pod }
+    pub fn spawn<Q>(rt: &RT, actor: A, supervisor: S) -> Sender<Q>
+    where
+        A: FnOnce(Mailbox<Q>) -> Fut,
+        Q: Queue<Msg = Msg>,
+    {
+        let pod = Arc::new(pod::Pod::new());
+        let fut = actor(Mailbox::new(pod.clone()));
+        let fut = async {
+            let result = fut.await;
+            supervisor.notify(result);
+        };
+        rt.spawn(fut);
+        Sender::new(pod)
+    }
 }
