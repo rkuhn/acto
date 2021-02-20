@@ -1,3 +1,9 @@
+//! Light-weight actor library for Rust
+//!
+//! Currently in early alpha stage: supports tokio for execution, currently only uses the MPSC channel (even for the SPSC API), should probably use feature flags, and still is quite slow.
+//!
+//! Please check out [the example](https://github.com/Actyx/actor/blob/master/examples/pingpong.rs)
+
 use std::{future::Future, sync::Arc};
 
 mod actor_id;

@@ -1,8 +1,14 @@
 [package]
-name = "actor"
+name = "acto"
 version = "0.1.0"
 authors = ["Roland Kuhn <rk@rkuhn.info>"]
 edition = "2018"
+description = "light-weight Actor library for Rust"
+repository = "https://github.com/Actyx/acto"
+documentation = "https://docs.rs/acto"
+license = "Apache-2.0 OR MIT"
+keywords = ["actors", "concurrency"]
+categories = ["concurrency"]
 
 [dependencies]
 derive_more = "0.99.11"
