@@ -1,6 +1,6 @@
 [package]
 name = "acto"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Roland Kuhn <rk@rkuhn.info>"]
 edition = "2018"
 description = "light-weight Actor library for Rust"
@@ -12,4 +12,6 @@ categories = ["concurrency"]
 
 [dependencies]
 derive_more = "0.99.11"
+futures = "0.3.14"
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1.5"
