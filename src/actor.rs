@@ -63,6 +63,8 @@ impl Spawner for TokioSpawner {
     fn spawn<N, A>(&mut self, actor: A) -> (ActorRef<N>, oneshot::Receiver<()>)
     where
         N: 'static + Send,
+        // this Pin-Box is only needed because there is no other way to specify that the
+        // Context’s lifetime shall match the Future’s lifetime (ugh)
         A: for<'a> FnOnce(Context<'a, N, Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
             + Send
             + 'static,
@@ -70,6 +72,10 @@ impl Spawner for TokioSpawner {
         let (tx_join, rx_join) = oneshot::channel();
         let (tx, rx) = unbounded_channel::<N>();
         let mk_ref = move || {
+            // problem: this keeps a sender around, so even when the last ActorRef has been
+            // dropped the channel stays alive — this is sometimes okay, the actor may hand
+            // out its self ref later again, but it makes it impossible to GC useless loop
+            // actors.
             let tx = tx.clone();
             ActorRef::new(Box::new(move |msg| {
                 let _ = tx.send(msg);
