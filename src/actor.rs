@@ -42,6 +42,16 @@ impl<'a, M, S: Spawner> Context<'a, M, S> {
     pub async fn receive(&mut self) -> M {
         self.mk_recv.make().await
     }
+
+    pub fn spawn<N, A>(&mut self, actor: A) -> (ActorRef<N>, oneshot::Receiver<()>)
+    where
+        N: 'static + Send,
+        A: for<'b> FnOnce(Context<'b, N, S>) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>>
+            + Send
+            + 'static,
+    {
+        self.spawner.spawn(actor)
+    }
 }
 
 pub trait MkReceive<M>: Send {
@@ -123,7 +133,7 @@ mod tests {
     async fn actor(mut ctx: Context<'_, (String, ActorRef<String>), impl Spawner>) {
         loop {
             let (name, sender) = ctx.receive().await;
-            let (responder, handle) = ctx.spawner.spawn(move |mut ctx| {
+            let (responder, handle) = ctx.spawn(move |mut ctx| {
                 async move {
                     let m = ctx.receive().await;
                     sender.tell(format!("Hello {}!", m));
