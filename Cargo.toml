@@ -11,6 +11,7 @@ keywords = ["actors", "concurrency"]
 categories = ["concurrency"]
 
 [dependencies]
+anyhow = "1.0.40"
 derive_more = "0.99.11"
 futures = "0.3.14"
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "sync"] }

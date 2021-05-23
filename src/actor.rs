@@ -19,7 +19,7 @@ impl<M> ActorRef<M> {
 pub struct Context<'a, M, S: Spawner> {
     mk_ref: &'a (dyn Fn() -> ActorRef<M> + Send + Sync),
     mk_recv: &'a mut dyn MkReceive<M>,
-    pub spawner: S,
+    spawner: S,
 }
 
 impl<'a, M, S: Spawner> Context<'a, M, S> {

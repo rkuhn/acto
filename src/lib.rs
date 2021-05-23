@@ -16,6 +16,7 @@ mod spsc;
 mod supervisor;
 
 pub mod actor;
+pub mod actor2;
 
 pub use actor_id::ActorId;
 pub use mailbox::{Mailbox, SenderGone};
