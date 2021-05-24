@@ -63,32 +63,30 @@
 #[macro_export]
 macro_rules! actor {
     ($mailbox:path, $spawner:path, fn $f:ident($ctx:ident$(,$arg:expr)*)) => {{
-        use $crate::Spawner;
         let _spawner = ::std::sync::Arc::new($spawner);
         let $ctx = $crate::Context::new($mailbox, _spawner.clone());
         let _aref = $ctx.me();
         let fut = Box::pin($f($ctx, $($arg),*));
-        (_aref, _spawner.spawn(fut))
+        (_aref, $crate::spawn(&*_spawner, fut))
     }};
     ($mailbox:path, $spawner:path, |$ctx:ident| $code:block) => {{
-        use $crate::Spawner;
         let _spawner = ::std::sync::Arc::new($spawner);
         let mut $ctx = $crate::Context::new($mailbox, _spawner.clone());
         let _aref = $ctx.me();
-        let fut = Box::pin(async move {
-            $code
-            Ok(())
-        });
-        (_aref, _spawner.spawn(fut))
+        let fut = async move {
+            let result: Result<_> = $code;
+            result
+        };
+        (_aref, $crate::spawn(&*_spawner, fut))
     }};
     ($mailbox:path, |$ctx:ident| $code:block) => {{
         let (fut, aref) = {
             let mut $ctx = $ctx.inherit($mailbox);
             let _aref = $ctx.me();
-            let fut = Box::pin(async move {
-                $code
-                Ok(())
-            });
+            let fut = async move {
+                let result: Result<_> = $code;
+                result
+            };
             (fut, _aref)
         };
         (aref, $ctx.spawn(fut))
@@ -101,3 +99,39 @@ pub mod tokio;
 
 pub use actor::{ActorRef, Context, Mailbox, NoActorRef, Receiver, Spawner};
 pub use anyhow::Result;
+
+use std::{any::Any, future::Future, pin::Pin};
+
+pub type FutureBox = Pin<Box<dyn Future<Output = Box<dyn Any + Send + 'static>> + Send + 'static>>;
+pub type FutureResultBox =
+    Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn Any + Send + 'static>>> + Send + 'static>>;
+
+pub fn any_box<F>(fut: F) -> FutureBox
+where
+    F: Future + Send + 'static,
+    F::Output: Any + Send + 'static,
+{
+    Box::pin(async move {
+        let result = fut.await;
+        Box::new(result) as Box<dyn Any + Send + 'static>
+    })
+}
+
+pub fn spawn<S, F>(
+    spawner: &S,
+    fut: F,
+) -> impl Future<Output = anyhow::Result<F::Output>> + Send + 'static
+where
+    S: Spawner + ?Sized,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let fut = spawner.spawn(any_box(fut));
+    async move {
+        let result = fut.await?;
+        match result.downcast::<F::Output>() {
+            Ok(out) => Ok(*out),
+            Err(_) => Err(anyhow::anyhow!("found wrong type in join handle")),
+        }
+    }
+}

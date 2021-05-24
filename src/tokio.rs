@@ -1,21 +1,19 @@
-use crate::{Mailbox, Receiver, Spawner};
+use crate::{FutureBox, FutureResultBox, Mailbox, Receiver, Spawner};
 use std::{future::Future, pin::Pin, task::Poll};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub struct TokioSpawner;
 
 impl Spawner for TokioSpawner {
-    fn spawn(
-        &self,
-        fut: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>,
-    ) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _ = fut.await;
-            let _ = tx.send(());
-        });
-        rx
+    fn spawn(&self, fut: FutureBox) -> FutureResultBox {
+        let fut = tokio::spawn(fut);
+        Box::pin(async move {
+            match fut.await {
+                Ok(result) => Ok(result),
+                Err(err) => Err(err.into()),
+            }
+        })
     }
 }
 
@@ -56,10 +54,8 @@ impl<M: Send + 'static> Future for TokioReceiver<M> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        tokio::{TokioMailbox, TokioSpawner},
-        ActorRef, Context, NoActorRef,
-    };
+    use super::*;
+    use crate::{ActorRef, Context, NoActorRef};
     use anyhow::Result;
     use futures::poll;
     use std::{task::Poll, thread::sleep, time::Duration};
@@ -71,6 +67,7 @@ mod tests {
             let (responder, handle) = actor!(TokioMailbox, |ctx| {
                 let m = ctx.receive().await?;
                 sender.tell(format!("Hello {}!", m));
+                Ok(())
             });
             responder.tell(name);
             let _ = handle.await;
@@ -85,22 +82,29 @@ mod tests {
         let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
+            Ok("buh")
         });
         aref.tell(("Fred".to_owned(), receiver));
         assert_eq!(rx.await.unwrap(), "Hello Fred!");
-        jr.await.unwrap();
+        assert_eq!(jr.await.unwrap().unwrap(), "buh");
 
         let (tx, rx) = oneshot::channel();
         let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
+            Ok(42)
         });
         aref.tell(("Barney".to_owned(), receiver));
         assert_eq!(rx.await.unwrap(), "Hello Barney!");
-        jr.await.unwrap();
+        assert_eq!(jr.await.unwrap().unwrap(), 42);
 
         drop(aref);
-        join_handle.await.unwrap();
+        join_handle
+            .await
+            .unwrap()
+            .unwrap_err()
+            .downcast::<NoActorRef>()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -109,6 +113,7 @@ mod tests {
         let (aref, handle) = actor!(TokioMailbox, TokioSpawner, |ctx| {
             let result: Result<()> = ctx.receive().await;
             let _ = tx.send(result);
+            Ok(())
         });
 
         sleep(Duration::from_millis(200));
@@ -118,7 +123,7 @@ mod tests {
         }
 
         drop(aref);
-        handle.await.unwrap();
+        handle.await.unwrap().unwrap();
         let err = match poll!(rx) {
             Poll::Ready(Ok(e)) => e.unwrap_err(),
             x => panic!("unexpected poll result: {:?}", x),

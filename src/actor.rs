@@ -1,4 +1,4 @@
-use ::tokio::sync::oneshot;
+use crate::{FutureBox, FutureResultBox};
 use anyhow::Result;
 use derive_more::{Display, Error};
 use parking_lot::Mutex;
@@ -115,11 +115,12 @@ impl<M: Send + 'static> Context<M> {
     /// Spawn a future for the purpose of running a child actor
     ///
     /// This method is best used via the [`actor`](macro.actor.html) macro.
-    pub fn spawn(
-        &self,
-        fut: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
-    ) -> oneshot::Receiver<()> {
-        self.spawner.spawn(fut)
+    pub fn spawn<F>(&self, fut: F) -> impl Future<Output = Result<F::Output>> + Send + 'static
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        crate::spawn(&*self.spawner, fut)
     }
 }
 
@@ -170,8 +171,5 @@ pub trait Mailbox {
 
 /// Facility for spawning a particular kind of Future that is used to run actors
 pub trait Spawner: Send + Sync + 'static {
-    fn spawn(
-        &self,
-        fut: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
-    ) -> oneshot::Receiver<()>;
+    fn spawn(&self, fut: FutureBox) -> FutureResultBox;
 }
