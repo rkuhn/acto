@@ -1,67 +1,45 @@
 use crate::{FutureBox, FutureResultBox, Mailbox, Receiver, Spawner};
+use async_std::{channel, task};
+use futures::StreamExt;
 use std::{future::Future, pin::Pin, task::Poll};
-use tokio::{runtime::Runtime, sync::mpsc};
 
-/// Spawner that uses the current tokio context
-///
-/// Will fail when used on a non-tokio thread.
-pub struct TokioSpawner;
+pub struct AsyncStdSpawner;
 
-impl Spawner for TokioSpawner {
+impl Spawner for AsyncStdSpawner {
     fn spawn(&self, fut: FutureBox) -> FutureResultBox {
-        let fut = tokio::spawn(fut);
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err.into()),
-            }
-        })
+        let fut = task::spawn(fut);
+        Box::pin(async move { Ok(fut.await) })
     }
 }
 
-/// Spawner that uses the given tokio runtime
-pub struct TokioRuntimeSpawner(pub Runtime);
+pub struct AsyncStdMailbox;
 
-impl Spawner for TokioRuntimeSpawner {
-    fn spawn(&self, fut: FutureBox) -> FutureResultBox {
-        let fut = self.0.spawn(fut);
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err.into()),
-            }
-        })
-    }
-}
-
-pub struct TokioMailbox;
-
-impl Mailbox for TokioMailbox {
+impl Mailbox for AsyncStdMailbox {
     fn make_mailbox<M: Send + 'static>(&self) -> (super::ActorRef<M>, Box<dyn Receiver<M>>) {
-        let (tx, rx) = mpsc::unbounded_channel::<M>();
+        let (tx, rx) = channel::unbounded::<M>();
         let aref = super::ActorRef::new(Box::new(move |msg| {
-            let _ = tx.send(msg);
+            let _ = tx.try_send(msg);
         }));
-        (aref, Box::new(TokioReceiver(rx)))
+        (aref, Box::new(AsyncStdReceiver(rx)))
     }
 }
 
-pub struct TokioReceiver<M>(mpsc::UnboundedReceiver<M>);
+pub struct AsyncStdReceiver<M>(channel::Receiver<M>);
 
-impl<M: Send + 'static> super::Receiver<M> for TokioReceiver<M> {
+impl<M: Send + 'static> super::Receiver<M> for AsyncStdReceiver<M> {
     fn receive(&mut self) -> &mut (dyn Future<Output = anyhow::Result<M>> + Send + Unpin + '_) {
         self
     }
 }
 
-impl<M: Send + 'static> Future for TokioReceiver<M> {
+impl<M: Send + 'static> Future for AsyncStdReceiver<M> {
     type Output = anyhow::Result<M>;
 
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.as_mut().0.poll_recv(cx) {
+        match self.as_mut().0.poll_next_unpin(cx) {
             Poll::Ready(Some(msg)) => Poll::Ready(Ok(msg)),
             Poll::Ready(None) => Poll::Ready(Err(anyhow::anyhow!("channel closed"))),
             Poll::Pending => Poll::Pending,
@@ -74,14 +52,13 @@ mod tests {
     use super::*;
     use crate::{ActorRef, Context, NoActorRef};
     use anyhow::Result;
-    use futures::poll;
+    use futures::{channel::oneshot, poll};
     use std::{task::Poll, thread::sleep, time::Duration};
-    use tokio::sync::oneshot;
 
     async fn actor(mut ctx: Context<(String, ActorRef<String>)>) -> Result<()> {
         loop {
             let (name, sender) = ctx.receive().await?;
-            let (responder, handle) = actor!(TokioMailbox, |ctx| {
+            let (responder, handle) = actor!(AsyncStdMailbox, |ctx| {
                 let m = ctx.receive().await?;
                 sender.tell(format!("Hello {}!", m));
                 Ok(())
@@ -91,12 +68,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[async_std::test]
     async fn smoke() {
-        let (aref, join_handle) = actor!(TokioMailbox, TokioSpawner, fn actor(ctx));
+        let (aref, join_handle) = actor!(AsyncStdMailbox, AsyncStdSpawner, fn actor(ctx));
 
         let (tx, rx) = oneshot::channel();
-        let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
+        let (receiver, jr) = actor!(AsyncStdMailbox, AsyncStdSpawner, |ctx| {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
             Ok("buh")
@@ -106,7 +83,7 @@ mod tests {
         assert_eq!(jr.await.unwrap().unwrap(), "buh");
 
         let (tx, rx) = oneshot::channel();
-        let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
+        let (receiver, jr) = actor!(AsyncStdMailbox, AsyncStdSpawner, |ctx| {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
             Ok(42)
@@ -124,10 +101,10 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[async_std::test]
     async fn dropped() {
         let (tx, mut rx) = oneshot::channel();
-        let (aref, handle) = actor!(TokioMailbox, TokioSpawner, |ctx| {
+        let (aref, handle) = actor!(AsyncStdMailbox, AsyncStdSpawner, |ctx| {
             let result: Result<()> = ctx.receive().await;
             let _ = tx.send(result);
             Ok(())

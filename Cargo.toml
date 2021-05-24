@@ -10,10 +10,18 @@ license = "Apache-2.0 OR MIT"
 keywords = ["actors", "concurrency"]
 categories = ["concurrency"]
 
+[features]
+with_async-std = ["async-std"]
+with_tokio = ["tokio"]
+with_futures = ["futures"]
+
 [dependencies]
 anyhow = "1.0.40"
+async-std = { version = "1.9.0", optional = true, features = ["attributes"] }
 derive_more = "0.99.11"
-futures = "0.3.14"
+futures = { version = "0.3.14", optional = true }
 parking_lot = "0.11.1"
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "sync"] }
-tokio-stream = "0.1.5"
+tokio = { version = "1", optional = true, features = ["rt", "macros", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+futures = { version = "0.3.14", features = ["executor"] }

@@ -62,14 +62,14 @@
 /// ```
 #[macro_export]
 macro_rules! actor {
-    ($mailbox:path, $spawner:path, fn $f:ident($ctx:ident$(,$arg:expr)*)) => {{
+    ($mailbox:expr, $spawner:expr, fn $f:ident($ctx:ident$(,$arg:expr)*)) => {{
         let _spawner = ::std::sync::Arc::new($spawner);
         let $ctx = $crate::Context::new($mailbox, _spawner.clone());
         let _aref = $ctx.me();
         let fut = Box::pin($f($ctx, $($arg),*));
         (_aref, $crate::spawn(&*_spawner, fut))
     }};
-    ($mailbox:path, $spawner:path, |$ctx:ident| $code:block) => {{
+    ($mailbox:expr, $spawner:expr, |$ctx:ident| $code:block) => {{
         let _spawner = ::std::sync::Arc::new($spawner);
         let mut $ctx = $crate::Context::new($mailbox, _spawner.clone());
         let _aref = $ctx.me();
@@ -79,7 +79,7 @@ macro_rules! actor {
         };
         (_aref, $crate::spawn(&*_spawner, fut))
     }};
-    ($mailbox:path, |$ctx:ident| $code:block) => {{
+    ($mailbox:expr, |$ctx:ident| $code:block) => {{
         let (fut, aref) = {
             let mut $ctx = $ctx.inherit($mailbox);
             let _aref = $ctx.me();
@@ -95,6 +95,12 @@ macro_rules! actor {
 
 mod actor;
 
+#[cfg(feature = "with_async-std")]
+pub mod async_std;
+#[cfg(feature = "with_futures")]
+pub mod thread;
+
+#[cfg(feature = "with_tokio")]
 pub mod tokio;
 
 pub use actor::{ActorRef, Context, Mailbox, NoActorRef, Receiver, Spawner};
