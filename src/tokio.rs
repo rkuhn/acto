@@ -1,151 +1,184 @@
-use crate::{FutureBox, FutureResultBox, Mailbox, Receiver, Spawner};
-use std::{future::Future, pin::Pin, task::Poll};
-use tokio::{runtime::Runtime, sync::mpsc};
+use crate::{
+    actor::{Dropper, Receiver, Sender, TaskFuture},
+    ActorError, Runtime,
+};
+use std::{boxed::Box, task::Poll};
+use tokio::{runtime::Handle, sync::mpsc};
 
-/// Spawner that uses the current tokio context
-///
-/// Will fail when used on a non-tokio thread.
-pub struct TokioSpawner;
-
-impl Spawner for TokioSpawner {
-    fn spawn(&self, fut: FutureBox) -> FutureResultBox {
-        let fut = tokio::spawn(fut);
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err.into()),
-            }
-        })
-    }
+#[derive(Clone)]
+pub struct Tokio {
+    runtime: Handle,
+    queue_size: usize,
+    error_reporter: Option<fn(ActorError)>,
 }
 
-/// Spawner that uses the given tokio runtime
-pub struct TokioRuntimeSpawner(pub Runtime);
-
-impl Spawner for TokioRuntimeSpawner {
-    fn spawn(&self, fut: FutureBox) -> FutureResultBox {
-        let fut = self.0.spawn(fut);
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err.into()),
-            }
-        })
+impl Tokio {
+    pub fn new(runtime: Handle, queue_size: usize) -> Self {
+        Self {
+            runtime,
+            queue_size,
+            error_reporter: None,
+        }
     }
-}
 
-pub struct TokioMailbox;
-
-impl Mailbox for TokioMailbox {
-    fn make_mailbox<M: Send + 'static>(&self) -> (super::ActorRef<M>, Box<dyn Receiver<M>>) {
-        let (tx, rx) = mpsc::unbounded_channel::<M>();
-        let aref = super::ActorRef::new(Box::new(move |msg| {
-            let _ = tx.send(msg);
-        }));
-        (aref, Box::new(TokioReceiver(rx)))
+    pub fn from_current(queue_size: usize) -> Self {
+        Self {
+            runtime: Handle::current(),
+            queue_size,
+            error_reporter: None,
+        }
     }
-}
 
-pub struct TokioReceiver<M>(mpsc::UnboundedReceiver<M>);
-
-impl<M: Send + 'static> super::Receiver<M> for TokioReceiver<M> {
-    fn receive(&mut self) -> &mut (dyn Future<Output = anyhow::Result<M>> + Send + Unpin + '_) {
-        self
-    }
-}
-
-impl<M: Send + 'static> Future for TokioReceiver<M> {
-    type Output = anyhow::Result<M>;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        match self.as_mut().0.poll_recv(cx) {
-            Poll::Ready(Some(msg)) => Poll::Ready(Ok(msg)),
-            Poll::Ready(None) => Poll::Ready(Err(anyhow::anyhow!("channel closed"))),
-            Poll::Pending => Poll::Pending,
+    pub fn with_error_reporter(self, error_reporter: fn(ActorError)) -> Self {
+        Self {
+            error_reporter: Some(error_reporter),
+            ..self
         }
     }
 }
 
-#[cfg(test)]
+impl Runtime for Tokio {
+    fn new_actor(&self, msg_size: usize, dropper: Dropper) -> (Sender, Receiver) {
+        let (tx, mut rx) = mpsc::channel(self.queue_size);
+        let tell = Box::new(move |bytes: *const u8| {
+            let bytes = unsafe { std::slice::from_raw_parts(bytes, msg_size) }.into();
+            let _ = tx.try_send(Message { bytes, dropper });
+        });
+        let recv: Receiver = Box::new(move |bytes, cx| {
+            // wtf
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some(msg)) => {
+                    unsafe { std::ptr::copy_nonoverlapping(msg.bytes.as_ptr(), bytes, msg_size) };
+                    msg.dispose();
+                    Poll::Ready(())
+                }
+                Poll::Ready(None) => unreachable!(),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        (tell, recv)
+    }
+
+    fn spawn(&self, task: TaskFuture) {
+        let error_reporter = self.error_reporter;
+        self.runtime.spawn(async move {
+            match task.await {
+                Ok(_) => {}
+                Err(e) => {
+                    if let Some(reporter) = error_reporter {
+                        (reporter)(e);
+                    }
+                }
+            }
+        });
+    }
+}
+
+struct Message {
+    bytes: Box<[u8]>,
+    dropper: unsafe fn(*mut u8),
+}
+
+impl Message {
+    fn dispose(mut self) {
+        fn no_drop(_x: *mut u8) {}
+        self.dropper = no_drop;
+    }
+}
+
+impl Drop for Message {
+    fn drop(&mut self) {
+        unsafe { (self.dropper)(self.bytes.as_mut_ptr()) };
+    }
+}
+
+#[cfg(all(test, feature = "with_tokio"))]
 mod tests {
     use super::*;
-    use crate::{ActorRef, Context, NoActorRef};
-    use anyhow::Result;
+    use crate::{spawn, ActorCell, ActorRef, ActorResult, NoActorRef};
     use futures::poll;
-    use std::{task::Poll, thread::sleep, time::Duration};
-    use tokio::sync::oneshot;
+    use std::{
+        task::Poll,
+        time::{Duration, Instant},
+    };
+    use tokio::{
+        sync::oneshot,
+        time::{sleep, timeout},
+    };
 
-    async fn actor(mut ctx: Context<(String, ActorRef<String>)>) -> Result<()> {
+    async fn actor(mut ctx: ActorCell<(String, ActorRef<String>)>) -> ActorResult {
         loop {
             let (name, sender) = ctx.receive().await?;
-            let (responder, handle) = actor!(TokioMailbox, |ctx| {
+            if name == "exit" {
+                break Ok(());
+            }
+            let responder = ctx.spawn(|mut ctx| async move {
                 let m = ctx.receive().await?;
                 sender.tell(format!("Hello {}!", m));
                 Ok(())
             });
             responder.tell(name);
-            let _ = handle.await;
         }
     }
 
     #[tokio::test]
     async fn smoke() {
-        let (aref, join_handle) = actor!(TokioMailbox, TokioSpawner, fn actor(ctx));
+        let rt = Tokio::from_current(12);
+        let aref = spawn(rt.clone(), actor);
 
         let (tx, rx) = oneshot::channel();
-        let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
+        let receiver = spawn(rt.clone(), |mut ctx| async move {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
-            Ok("buh")
+            Ok(())
         });
         aref.tell(("Fred".to_owned(), receiver));
         assert_eq!(rx.await.unwrap(), "Hello Fred!");
-        assert_eq!(jr.await.unwrap().unwrap(), "buh");
 
         let (tx, rx) = oneshot::channel();
-        let (receiver, jr) = actor!(TokioMailbox, TokioSpawner, |ctx| {
+        let receiver = spawn(rt, |mut ctx| async move {
             let msg = ctx.receive().await?;
             let _ = tx.send(msg);
-            Ok(42)
+            Ok(())
         });
-        aref.tell(("Barney".to_owned(), receiver));
+        aref.tell(("Barney".to_owned(), receiver.clone()));
         assert_eq!(rx.await.unwrap(), "Hello Barney!");
-        assert_eq!(jr.await.unwrap().unwrap(), 42);
 
-        drop(aref);
-        join_handle
-            .await
-            .unwrap()
-            .unwrap_err()
-            .downcast::<NoActorRef>()
-            .unwrap();
+        aref.tell(("exit".to_owned(), receiver));
+        let now = Instant::now();
+        while now.elapsed() < Duration::from_secs(3) {
+            if aref.is_dead() {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        panic!("actor did not stop");
     }
 
     #[tokio::test]
     async fn dropped() {
         let (tx, mut rx) = oneshot::channel();
-        let (aref, handle) = actor!(TokioMailbox, TokioSpawner, |ctx| {
-            let result: Result<()> = ctx.receive().await;
-            let _ = tx.send(result);
-            Ok(())
-        });
+        let aref = spawn(
+            Tokio::from_current(12),
+            |mut ctx: ActorCell<()>| async move {
+                let result = ctx.receive().await;
+                let _ = tx.send(result);
+                Ok(())
+            },
+        );
 
-        sleep(Duration::from_millis(200));
+        sleep(Duration::from_millis(200)).await;
         match poll!(&mut rx) {
             Poll::Pending => {}
             x => panic!("unexpected result: {:?}", x),
         }
 
         drop(aref);
-        handle.await.unwrap().unwrap();
-        let err = match poll!(rx) {
-            Poll::Ready(Ok(e)) => e.unwrap_err(),
-            x => panic!("unexpected poll result: {:?}", x),
-        };
-        err.downcast::<NoActorRef>()
-            .unwrap_or_else(|e| panic!("unexpected error type: {}", e));
+        let err = timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err, NoActorRef);
     }
 }

@@ -2,9 +2,9 @@
 name = "acto"
 version = "0.2.0"
 authors = ["Roland Kuhn <rk@rkuhn.info>"]
-edition = "2018"
+edition = "2021"
 description = "light-weight Actor library for Rust"
-repository = "https://github.com/Actyx/acto"
+repository = "https://github.com/rkuhn/acto"
 documentation = "https://docs.rs/acto"
 license = "Apache-2.0 OR MIT"
 keywords = ["actors", "concurrency"]
@@ -13,15 +13,13 @@ categories = ["concurrency"]
 [features]
 with_async-std = ["async-std"]
 with_tokio = ["tokio"]
-with_futures = ["futures"]
 
 [dependencies]
-anyhow = "1.0.40"
-async-std = { version = "1.9.0", optional = true, features = ["attributes"] }
-derive_more = "0.99.11"
-futures = { version = "0.3.14", optional = true }
-parking_lot = "0.11.1"
-tokio = { version = "1", optional = true, features = ["rt", "macros", "rt-multi-thread", "sync"] }
+async-std = { version = "1", optional = true, features = ["attributes"] }
+futures = { version = "0.3" }
+parking_lot = "0.12"
+tokio = { version = "1", optional = true }
 
 [dev-dependencies]
-futures = { version = "0.3.14", features = ["executor"] }
+futures = { version = "0.3", features = ["executor"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
