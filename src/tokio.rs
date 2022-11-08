@@ -1,184 +1,184 @@
-use crate::{
-    actor::{Dropper, Receiver, Sender, TaskFuture},
-    ActorError, Runtime,
+use crate::{ActoRuntime, ActorId, JoinHandle, Receiver, Sender};
+use std::{
+    any::Any,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
 };
-use std::{boxed::Box, task::Poll};
-use tokio::{runtime::Handle, sync::mpsc};
+use tokio::{
+    runtime::Handle,
+    sync::mpsc::{self, error::TrySendError},
+};
 
 #[derive(Clone)]
-pub struct Tokio {
-    runtime: Handle,
-    queue_size: usize,
-    error_reporter: Option<fn(ActorError)>,
-}
+pub struct TokioActor(Arc<Inner>);
 
-impl Tokio {
-    pub fn new(runtime: Handle, queue_size: usize) -> Self {
-        Self {
-            runtime,
-            queue_size,
-            error_reporter: None,
-        }
-    }
-
-    pub fn from_current(queue_size: usize) -> Self {
-        Self {
-            runtime: Handle::current(),
-            queue_size,
-            error_reporter: None,
-        }
-    }
-
-    pub fn with_error_reporter(self, error_reporter: fn(ActorError)) -> Self {
-        Self {
-            error_reporter: Some(error_reporter),
-            ..self
-        }
+impl TokioActor {
+    pub fn new(handle: &Handle, name: impl Into<String>) -> Self {
+        Self(Arc::new(Inner {
+            name: name.into(),
+            id: AtomicUsize::new(1),
+            handle: handle.clone(),
+            mailbox_size: 128,
+        }))
     }
 }
 
-impl Runtime for Tokio {
-    fn new_actor(&self, msg_size: usize, dropper: Dropper) -> (Sender, Receiver) {
-        let (tx, mut rx) = mpsc::channel(self.queue_size);
-        let tell = Box::new(move |bytes: *const u8| {
-            let bytes = unsafe { std::slice::from_raw_parts(bytes, msg_size) }.into();
-            let _ = tx.try_send(Message { bytes, dropper });
-        });
-        let recv: Receiver = Box::new(move |bytes, cx| {
-            // wtf
-            match rx.poll_recv(cx) {
-                Poll::Ready(Some(msg)) => {
-                    unsafe { std::ptr::copy_nonoverlapping(msg.bytes.as_ptr(), bytes, msg_size) };
-                    msg.dispose();
-                    Poll::Ready(())
-                }
-                Poll::Ready(None) => unreachable!(),
-                Poll::Pending => Poll::Pending,
-            }
-        });
-        (tell, recv)
+struct Inner {
+    name: String,
+    id: AtomicUsize,
+    handle: Handle,
+    mailbox_size: usize,
+}
+
+impl ActoRuntime for TokioActor {
+    type JoinHandle<O: Send + 'static> = TokioJoinHandle<O>;
+    type Sender<M: Send + 'static> = TokioSender<M>;
+    type Receiver<M: Send + 'static> = TokioReceiver<M>;
+
+    fn next_id(&self) -> ActorId {
+        ActorId::new(self.0.id.fetch_add(1, Ordering::Relaxed))
     }
 
-    fn spawn(&self, task: TaskFuture) {
-        let error_reporter = self.error_reporter;
-        self.runtime.spawn(async move {
-            match task.await {
-                Ok(_) => {}
-                Err(e) => {
-                    if let Some(reporter) = error_reporter {
-                        (reporter)(e);
+    fn mailbox<M: Send + 'static>(&self) -> (Self::Sender<M>, Self::Receiver<M>) {
+        let (tx, rx) = mpsc::channel(self.0.mailbox_size);
+        (TokioSender(tx), TokioReceiver(rx))
+    }
+
+    fn spawn_task<T>(&self, id: ActorId, task: T) -> Self::JoinHandle<T::Output>
+    where
+        T: std::future::Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        TokioJoinHandle(id, self.0.handle.spawn(task))
+    }
+
+    fn fmt(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(f, "{}", self.0.name)
+    }
+}
+
+pub struct TokioSender<M>(mpsc::Sender<M>);
+impl<M: Send + 'static> Sender<M> for TokioSender<M> {
+    fn send(&self, msg: M) -> Result<(), M> {
+        match self.0.try_send(msg) {
+            Ok(_) => Ok(()),
+            Err(TrySendError::Closed(m)) => Err(m),
+            Err(TrySendError::Full(m)) => Err(m),
+        }
+    }
+}
+
+pub struct TokioReceiver<M>(mpsc::Receiver<M>);
+impl<M: Send + 'static> Receiver<M> for TokioReceiver<M> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<M> {
+        self.0.poll_recv(cx).map(Option::unwrap)
+    }
+}
+
+pub struct TokioJoinHandle<O>(ActorId, tokio::task::JoinHandle<O>);
+impl<O: Send + 'static> JoinHandle for TokioJoinHandle<O> {
+    type Output = O;
+
+    fn id(&self) -> ActorId {
+        self.0
+    }
+
+    fn abort(self) {
+        self.1.abort();
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
+        Pin::new(&mut self.1)
+            .poll(cx)
+            .map(|r| r.map_err(|err| Box::new(err) as Box<dyn Any + Send + 'static>))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokioActor;
+    use crate::{join, ActoRuntime, ActorId, RecvResult};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::{runtime::Runtime, sync::oneshot};
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn run() {
+        let rt = Runtime::new().unwrap();
+        let sys = TokioActor::new(rt.handle(), "test");
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let (r, j) = sys.spawn_actor(|mut ctx| async move {
+            flag2.store(true, Ordering::Relaxed);
+            ctx.recv().await;
+            flag2.store(false, Ordering::Relaxed);
+            42
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(flag.load(Ordering::Relaxed));
+        r.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!flag.load(Ordering::Relaxed));
+        let ret = rt.block_on(join(j));
+        assert_eq!(ret.unwrap(), 42);
+    }
+
+    #[test]
+    fn child() {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::builder().parse("trace").unwrap())
+            .init();
+        let rt = Runtime::new().unwrap();
+        let sys = TokioActor::new(rt.handle(), "test");
+        let (r, j) = sys.spawn_actor(|mut ctx| async move {
+            let mut v: Vec<i32> = vec![];
+            let mut running = BTreeMap::<ActorId, (i32, oneshot::Sender<()>)>::new();
+            loop {
+                match ctx.recv().await {
+                    RecvResult::NoMoreSenders => break,
+                    RecvResult::Supervision(id, x) => {
+                        let (arg, tx) = running.remove(&id).unwrap();
+                        let res = x.downcast::<Result<i32, i32>>().unwrap();
+                        v.push(arg);
+                        v.push(res.unwrap_or_else(|x| x));
+                        tx.send(()).unwrap();
+                    }
+                    RecvResult::Message((x, tx)) => {
+                        v.push(x);
+                        let r = ctx.spawn_supervised(|mut ctx| async move {
+                            if let RecvResult::Message(x) = ctx.recv().await {
+                                Ok(2 * x)
+                            } else {
+                                Err(5)
+                            }
+                        });
+                        r.send(x).unwrap();
+                        running.insert(r.id(), (x, tx));
                     }
                 }
             }
+            v
         });
-    }
-}
-
-struct Message {
-    bytes: Box<[u8]>,
-    dropper: unsafe fn(*mut u8),
-}
-
-impl Message {
-    fn dispose(mut self) {
-        fn no_drop(_x: *mut u8) {}
-        self.dropper = no_drop;
-    }
-}
-
-impl Drop for Message {
-    fn drop(&mut self) {
-        unsafe { (self.dropper)(self.bytes.as_mut_ptr()) };
-    }
-}
-
-#[cfg(all(test, feature = "with_tokio"))]
-mod tests {
-    use super::*;
-    use crate::{spawn, ActorCell, ActorRef, ActorResult, NoActorRef};
-    use futures::poll;
-    use std::{
-        task::Poll,
-        time::{Duration, Instant},
-    };
-    use tokio::{
-        sync::oneshot,
-        time::{sleep, timeout},
-    };
-
-    async fn actor(mut ctx: ActorCell<(String, ActorRef<String>)>) -> ActorResult {
-        loop {
-            let (name, sender) = ctx.receive().await?;
-            if name == "exit" {
-                break Ok(());
-            }
-            let responder = ctx.spawn(|mut ctx| async move {
-                let m = ctx.receive().await?;
-                sender.tell(format!("Hello {}!", m));
-                Ok(())
-            });
-            responder.tell(name);
-        }
-    }
-
-    #[tokio::test]
-    async fn smoke() {
-        let rt = Tokio::from_current(12);
-        let aref = spawn(rt.clone(), actor);
-
         let (tx, rx) = oneshot::channel();
-        let receiver = spawn(rt.clone(), |mut ctx| async move {
-            let msg = ctx.receive().await?;
-            let _ = tx.send(msg);
-            Ok(())
-        });
-        aref.tell(("Fred".to_owned(), receiver));
-        assert_eq!(rx.await.unwrap(), "Hello Fred!");
-
+        r.send((1, tx)).unwrap();
+        rt.block_on(rx).unwrap();
         let (tx, rx) = oneshot::channel();
-        let receiver = spawn(rt, |mut ctx| async move {
-            let msg = ctx.receive().await?;
-            let _ = tx.send(msg);
-            Ok(())
-        });
-        aref.tell(("Barney".to_owned(), receiver.clone()));
-        assert_eq!(rx.await.unwrap(), "Hello Barney!");
-
-        aref.tell(("exit".to_owned(), receiver));
-        let now = Instant::now();
-        while now.elapsed() < Duration::from_secs(3) {
-            if aref.is_dead() {
-                return;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-        panic!("actor did not stop");
-    }
-
-    #[tokio::test]
-    async fn dropped() {
-        let (tx, mut rx) = oneshot::channel();
-        let aref = spawn(
-            Tokio::from_current(12),
-            |mut ctx: ActorCell<()>| async move {
-                let result = ctx.receive().await;
-                let _ = tx.send(result);
-                Ok(())
-            },
-        );
-
-        sleep(Duration::from_millis(200)).await;
-        match poll!(&mut rx) {
-            Poll::Pending => {}
-            x => panic!("unexpected result: {:?}", x),
-        }
-
-        drop(aref);
-        let err = timeout(Duration::from_secs(3), rx)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(err, NoActorRef);
+        r.send((2, tx)).unwrap();
+        rt.block_on(rx).unwrap();
+        drop(r);
+        let v = rt.block_on(join(j)).unwrap();
+        assert_eq!(v, vec![1, 1, 2, 2, 2, 4]);
     }
 }

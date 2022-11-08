@@ -1,220 +1,275 @@
-use futures::{future::BoxFuture, FutureExt};
 use parking_lot::Mutex;
 use std::{
-    error::Error,
-    future::Future,
+    any::Any,
+    fmt::{Debug, Display, Write},
+    future::{poll_fn, Future},
     marker::PhantomData,
-    mem::{size_of, MaybeUninit},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
 };
 
-pub fn spawn<F, M, Fut>(runtime: impl Runtime, actor: F) -> ActorRef<M>
-where
-    F: FnOnce(ActorCell<M>) -> Fut,
-    Fut: Future<Output = ActorResult> + Send + 'static,
-    M: Unpin + Send + 'static,
-{
-    let (tell, recv) = runtime.new_actor(size_of::<M>(), unsafe {
-        std::mem::transmute(std::ptr::drop_in_place::<M> as unsafe fn(*mut M))
-    });
-    let runtime: Arc<dyn Runtime> = Arc::new(runtime);
-    let aref = ActorRef::new(tell);
-    let ctx = ActorCell::new(recv, aref.clone(), runtime.clone());
-    runtime.spawn(actor(ctx).boxed());
-    aref
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActorId(usize);
+
+impl ActorId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
 }
 
-/// An ActorRef is the sending side of the actor’s mailbox, it can be freely cloned.
-///
-/// When the last `ActorRef` for an actor has been dropped, only the actor itself can
-/// fabricate a new one. And if the actor is waiting for new messages from its mailbox
-/// before a new `ActorRef` is created, the actor would be stuck in this state forever.
-/// Therefore, the actor’s `receive()` function returns an error in this case, which
-/// will usually lead to the actor shutting down.
-pub struct ActorRef<M>(Arc<ActorRefInner>, PhantomData<M>);
+pub struct ActorRef<M>(Arc<ActorRefInner<M, dyn Sender<M>>>);
+
+struct ActorRefInner<M, S: ?Sized> {
+    id: ActorId,
+    count: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
+    _ph: PhantomData<M>,
+    sender: S,
+}
+
+impl<M> ActorRef<M> {
+    pub fn id(&self) -> ActorId {
+        self.0.id
+    }
+}
+
+impl<M: Send + 'static> ActorRef<M> {
+    pub fn send(&self, msg: M) -> Result<(), M> {
+        tracing::trace!(target = ?self, "send");
+        self.0.sender.send(msg)
+    }
+}
 
 impl<M> Clone for ActorRef<M> {
     fn clone(&self) -> Self {
-        self.0.count.fetch_add(1, Ordering::SeqCst);
-        Self(self.0.clone(), PhantomData)
+        self.0.count.fetch_add(1, Ordering::Relaxed);
+        Self(self.0.clone())
     }
 }
 
 impl<M> Drop for ActorRef<M> {
     fn drop(&mut self) {
-        let prev = self.0.count.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            // we’re the last external reference, so wake up the Actor if it is waiting for us
-            if let Some(waker) = self.0.waker.lock().take() {
+        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let waker = self.0.waker.lock().take();
+            if let Some(waker) = waker {
                 waker.wake();
             }
         }
     }
 }
 
-impl<M> ActorRef<M> {
-    fn new(tell: Sender) -> Self {
-        Self(
-            Arc::new(ActorRefInner {
-                count: AtomicUsize::new(0),
-                waker: Mutex::new(None),
-                tell,
-                dropped: AtomicBool::new(false),
-            }),
-            PhantomData,
-        )
-    }
-
-    pub fn tell(&self, msg: M) {
-        let bytes = &msg as *const _ as *const u8;
-        std::mem::forget(msg);
-        (self.0.tell)(bytes);
-    }
-
-    pub fn is_dead(&self) -> bool {
-        self.0.dropped.load(Ordering::Acquire)
+impl<M> Debug for ActorRef<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ActorRef").field(&self.0.id.0).finish()
     }
 }
 
-struct ActorRefInner {
-    count: AtomicUsize,
-    waker: Mutex<Option<Waker>>,
-    tell: Box<dyn Fn(*const u8) + Send + Sync + 'static>,
-    dropped: AtomicBool,
-}
-
-pub type Dropper = unsafe fn(*mut u8);
-pub type Sender = Box<dyn Fn(*const u8) + Send + Sync + 'static>;
-pub type Receiver = Box<dyn FnMut(*mut u8, &mut Context<'_>) -> Poll<()> + Send + 'static>;
-pub type TaskFuture = BoxFuture<'static, ActorResult>;
-pub type ActorResult = Result<(), ActorError>;
-
-pub enum ActorError {
-    NoActorRef,
-    Other(Box<dyn Error + Send + 'static>),
-}
-
-impl From<NoActorRef> for ActorError {
-    fn from(_: NoActorRef) -> Self {
-        ActorError::NoActorRef
+impl<M: Named> Display for ActorRef<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ActorRef<")?;
+        M::fmt(f)?;
+        write!(f, ">({})", self.0.id.0)?;
+        Ok(())
     }
 }
 
-impl<E: Error + Send + 'static> From<E> for ActorError {
-    fn from(e: E) -> Self {
-        ActorError::Other(Box::new(e))
-    }
+pub trait Named {
+    fn fmt(f: &mut impl Write) -> std::fmt::Result;
 }
 
-pub trait Runtime: Send + Sync + 'static {
-    fn new_actor(&self, msg_size: usize, dropper: Dropper) -> (Sender, Receiver);
-    fn spawn(&self, task: TaskFuture);
+pub struct Cell<M: Send + 'static, R: ActoRuntime> {
+    me: ActorRef<M>,
+    runtime: R,
+    recv: R::Receiver<M>,
+    supervised: Vec<Box<dyn JoinHandle<Output = ()>>>,
+    no_senders_signaled: bool,
 }
 
-/// The context in which an actor is running
-///
-/// This context allows the actor to
-///
-/// - receive messages
-/// - get its own address (i.e. [`ActorRef`](struct.ActorRef.html))
-/// - spawn new actors
-pub struct ActorCell<M> {
-    recv: Receiver,
-    aref: ActorRef<M>,
-    runtime: Arc<dyn Runtime>,
-}
-
-impl<M> Drop for ActorCell<M> {
-    fn drop(&mut self) {
-        self.aref.0.dropped.store(true, Ordering::Release);
-    }
-}
-
-impl<M: Unpin + Send + 'static> ActorCell<M> {
-    pub fn new(recv: Receiver, aref: ActorRef<M>, runtime: Arc<dyn Runtime>) -> Self {
-        Self {
-            recv,
-            aref,
-            runtime,
-        }
+impl<M: Send + 'static, R: ActoRuntime> Cell<M, R> {
+    pub fn me(&mut self) -> ActorRef<M> {
+        self.no_senders_signaled = false;
+        self.me.clone()
     }
 
-    /// Receive the next message from the mailbox, possibly waiting for it
-    ///
-    /// This method’s return value should always be immediately `.await`ed, it has no other use.
-    pub fn receive(&mut self) -> impl Future<Output = Result<M, NoActorRef>> + '_ {
-        ReceiveFuture {
-            aref: &self.aref.0,
-            poll: &mut self.recv,
-            _ph: PhantomData,
-        }
-    }
-
-    /// The actors own address a.k.a. ActorRef
-    ///
-    /// The actor can put this `ActorRef` into messages to send it to other actors so that they
-    /// can contact this actor back later.
-    pub fn me(&self) -> ActorRef<M> {
-        self.aref.clone()
-    }
-
-    /// Spawn a future for the purpose of running a child actor
-    ///
-    /// This method is best used via the [`actor`](macro.actor.html) macro.
-    pub fn spawn<F, M2, Fut>(&self, actor: F) -> ActorRef<M2>
-    where
-        F: FnOnce(ActorCell<M2>) -> Fut,
-        Fut: Future<Output = ActorResult> + Send + 'static,
-        M2: Unpin + Send + 'static,
-    {
-        let (aref, recv) = self.runtime.new_actor(size_of::<M2>(), unsafe {
-            std::mem::transmute(std::ptr::drop_in_place::<M2> as unsafe fn(*mut M2))
-        });
-        let aref = ActorRef::new(aref);
-        let ctx = ActorCell::new(recv, aref.clone(), self.runtime.clone());
-        self.runtime.spawn(actor(ctx).boxed());
-        aref
-    }
-}
-
-struct ReceiveFuture<'a, M> {
-    aref: &'a ActorRefInner,
-    poll: &'a mut (dyn for<'b, 'c> FnMut(*mut u8, &'b mut Context<'c>) -> Poll<()> + Send + 'a),
-    _ph: PhantomData<M>,
-}
-
-impl<'a, M: Unpin + Send + 'static> Future for ReceiveFuture<'a, M> {
-    type Output = Result<M, NoActorRef>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut msg = MaybeUninit::uninit();
-        match (this.poll)(msg.as_mut_ptr() as *mut u8, cx) {
-            Poll::Ready(_) => Poll::Ready(Ok(unsafe { msg.assume_init() })),
-            Poll::Pending => {
-                if this.aref.count.load(Ordering::SeqCst) == 0 {
-                    // observing no external address means that there cannot be one created, either:
-                    // we hold an exclusive reference on the Context (via this.poll)
-                    Poll::Ready(Err(NoActorRef))
-                } else {
-                    *this.aref.waker.lock() = Some(cx.waker().clone());
-                    // in case the last ActorRef was dropped between the check and installing the waker,
-                    // we must now re-check
-                    if this.aref.count.load(Ordering::SeqCst) == 0 {
-                        Poll::Ready(Err(NoActorRef))
-                    } else {
-                        Poll::Pending
-                    }
+    pub fn recv(&mut self) -> impl Future<Output = RecvResult<M>> + '_ {
+        poll_fn(|cx| {
+            for idx in 0..self.supervised.len() {
+                let p = self.supervised[idx].poll(cx);
+                if let Poll::Ready(x) = p {
+                    let handle = self.supervised.remove(idx);
+                    tracing::trace!(me = ?self.me.id(), src = ?handle.id(), "supervision");
+                    return Poll::Ready(RecvResult::Supervision(handle.id(), x.unwrap_err()));
                 }
             }
-        }
+            if let Poll::Ready(msg) = self.recv.poll(cx) {
+                tracing::trace!(me = ?self.me.id(), "message");
+                return Poll::Ready(RecvResult::Message(msg));
+            }
+            if self.me.0.count.load(Ordering::Relaxed) == 0 {
+                tracing::trace!(me = ?self.me.id(), "no sender");
+                if !self.no_senders_signaled {
+                    self.no_senders_signaled = true;
+                    return Poll::Ready(RecvResult::NoMoreSenders);
+                }
+            } else if !self.no_senders_signaled {
+                // only install waker if we’re interested in emitting NoMoreSenders
+                *self.me.0.waker.lock() = Some(cx.waker().clone());
+                // re-check in case last ref was dropped between check and lock
+                if self.me.0.count.load(Ordering::Relaxed) == 0 {
+                    tracing::trace!(me = ?self.me.id(), "no sender");
+                    self.no_senders_signaled = true;
+                    return Poll::Ready(RecvResult::NoMoreSenders);
+                }
+            }
+            tracing::trace!(me = ?self.me.id(), "nothing");
+            Poll::Pending
+        })
+    }
+
+    pub fn spawn<T: Send + 'static, F, Fut>(&self, actor: F) -> SupervisedRef<T, R, Fut::Output>
+    where
+        F: FnOnce(Cell<T, R>) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let (me, join) = self.runtime.spawn_actor(actor);
+        tracing::trace!(me = ?self.me.id(), new = ?me.id(), "spawn");
+        SupervisedRef { me, join }
+    }
+
+    pub fn spawn_supervised<T: Send + 'static, F, Fut>(&mut self, actor: F) -> ActorRef<T>
+    where
+        F: FnOnce(Cell<T, R>) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.supervise(self.spawn(actor))
+    }
+
+    pub fn supervise<T: Send + 'static, R2: ActoRuntime, O: Send + 'static>(
+        &mut self,
+        actor: SupervisedRef<T, R2, O>,
+    ) -> ActorRef<T> {
+        tracing::trace!(me = ?self.me.id(), target = ?actor.me.id(), "supervise");
+        self.supervised.push(Box::new(JoinHandleBox(actor.join)));
+        actor.me
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct NoActorRef;
+pub struct SupervisedRef<M, R: ActoRuntime, O: Send + 'static> {
+    pub me: ActorRef<M>,
+    pub join: R::JoinHandle<O>,
+}
+
+#[derive(Debug)]
+pub enum RecvResult<M> {
+    NoMoreSenders,
+    Supervision(ActorId, Box<dyn Any + Send + 'static>),
+    Message(M),
+}
+
+pub trait ActoRuntime: Clone + Send + Sync + 'static {
+    type JoinHandle<O: Send + 'static>: JoinHandle<Output = O>;
+    type Sender<M: Send + 'static>: Sender<M>;
+    type Receiver<M: Send + 'static>: Receiver<M>;
+
+    fn fmt(&self, f: &mut impl Write) -> std::fmt::Result;
+
+    fn next_id(&self) -> ActorId;
+
+    fn mailbox<M: Send + 'static>(&self) -> (Self::Sender<M>, Self::Receiver<M>);
+
+    fn spawn_task<T>(&self, id: ActorId, task: T) -> Self::JoinHandle<T::Output>
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static;
+
+    fn spawn_actor<T, F, Fut>(&self, actor: F) -> (ActorRef<T>, Self::JoinHandle<Fut::Output>)
+    where
+        T: Send + 'static,
+        F: FnOnce(Cell<T, Self>) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let (sender, recv) = self.mailbox();
+        let id = self.next_id();
+        let inner = ActorRefInner {
+            id,
+            count: AtomicUsize::new(0),
+            waker: Mutex::new(None),
+            _ph: PhantomData,
+            sender,
+        };
+        let me = ActorRef(Arc::new(inner));
+        let ctx = Cell {
+            me: me.clone(),
+            runtime: self.clone(),
+            recv,
+            supervised: vec![],
+            no_senders_signaled: false,
+        };
+        let handle = self.spawn_task(id, (actor)(ctx));
+        (me, handle)
+    }
+}
+
+pub trait Sender<M>: Send + Sync + 'static {
+    fn send(&self, msg: M) -> Result<(), M>;
+}
+
+pub trait Receiver<M>: Send + 'static {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<M>;
+}
+
+pub trait JoinHandle: Unpin + Send + 'static {
+    type Output;
+    fn id(&self) -> ActorId;
+    fn abort(self);
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Output, Box<dyn Any + Send + 'static>>>;
+}
+
+pub fn join<J: JoinHandle>(
+    handle: J,
+) -> impl Future<Output = Result<J::Output, Box<dyn Any + Send + 'static>>> {
+    JoinHandleFuture(handle)
+}
+
+struct JoinHandleFuture<J>(J);
+impl<J: JoinHandle> Future for JoinHandleFuture<J> {
+    type Output = Result<J::Output, Box<dyn Any + Send + 'static>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        tracing::trace!(join = ?self.as_ref().0.id(), "poll");
+        self.get_mut().0.poll(cx)
+    }
+}
+
+struct JoinHandleBox<J: JoinHandle>(J);
+impl<J> JoinHandle for JoinHandleBox<J>
+where
+    J: JoinHandle,
+    J::Output: Send + 'static,
+{
+    type Output = ();
+
+    fn id(&self) -> ActorId {
+        self.0.id()
+    }
+
+    fn abort(self) {
+        self.0.abort()
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Box<dyn Any + Send + 'static>>> {
+        self.0
+            .poll(cx)
+            .map(|r| r.and_then(|x| Err(Box::new(x) as Box<dyn Any + Send + 'static>)))
+    }
+}
