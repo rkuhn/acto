@@ -1,9 +1,9 @@
-use acto::{join, tokio::TokioActor, ActoRuntime, Cell, RecvResult};
+use acto::{join, tokio::ActoTokio, ActoCell, ActoInput, ActoRuntime};
 use tokio::runtime::Runtime;
 
-async fn actor(mut ctx: Cell<i32, impl ActoRuntime>) {
+async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     println!("main actor started");
-    while let RecvResult::Message(m) = ctx.recv().await {
+    while let ActoInput::Message(m) = ctx.recv().await {
         ctx.spawn_supervised(|mut ctx| async move {
             println!("spawned actor for {:?}", ctx.recv().await);
         })
@@ -12,9 +12,9 @@ async fn actor(mut ctx: Cell<i32, impl ActoRuntime>) {
 
         let r = ctx.spawn(|mut ctx| async move {
             match ctx.recv().await {
-                RecvResult::NoMoreSenders => "no send".to_owned(),
-                RecvResult::Supervision(_, _) => unreachable!(),
-                RecvResult::Message(m) => {
+                ActoInput::NoMoreSenders => "no send".to_owned(),
+                ActoInput::Supervision(_, _) => unreachable!(),
+                ActoInput::Message(m) => {
                     println!("received {}", m);
                     "send".to_owned()
                 }
@@ -28,7 +28,7 @@ async fn actor(mut ctx: Cell<i32, impl ActoRuntime>) {
 
 fn main() {
     let rt = Runtime::new().unwrap();
-    let system = TokioActor::new(rt.handle(), "theMain");
+    let system = ActoTokio::new(rt.handle(), "theMain");
     let (r, j) = system.spawn_actor(actor);
     r.send(1).unwrap();
     r.send(2).unwrap();

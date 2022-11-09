@@ -1,4 +1,4 @@
-use crate::{ActoRuntime, ActorId, JoinHandle, Receiver, Sender};
+use crate::{ActoHandle, ActoId, ActoRuntime, Receiver, Sender};
 use std::{
     any::Any,
     future::Future,
@@ -14,10 +14,11 @@ use tokio::{
     sync::mpsc::{self, error::TrySendError},
 };
 
+/// An [`ActoRuntime`] based on [`tokio::runtime`] and [`tokio::sync::mpsc`] queues.
 #[derive(Clone)]
-pub struct TokioActor(Arc<Inner>);
+pub struct ActoTokio(Arc<Inner>);
 
-impl TokioActor {
+impl ActoTokio {
     pub fn new(handle: &Handle, name: impl Into<String>) -> Self {
         Self(Arc::new(Inner {
             name: name.into(),
@@ -35,13 +36,13 @@ struct Inner {
     mailbox_size: usize,
 }
 
-impl ActoRuntime for TokioActor {
-    type JoinHandle<O: Send + 'static> = TokioJoinHandle<O>;
+impl ActoRuntime for ActoTokio {
+    type ActoHandle<O: Send + 'static> = TokioJoinHandle<O>;
     type Sender<M: Send + 'static> = TokioSender<M>;
     type Receiver<M: Send + 'static> = TokioReceiver<M>;
 
-    fn next_id(&self) -> ActorId {
-        ActorId::new(self.0.id.fetch_add(1, Ordering::Relaxed))
+    fn next_id(&self) -> usize {
+        self.0.id.fetch_add(1, Ordering::Relaxed)
     }
 
     fn mailbox<M: Send + 'static>(&self) -> (Self::Sender<M>, Self::Receiver<M>) {
@@ -49,7 +50,7 @@ impl ActoRuntime for TokioActor {
         (TokioSender(tx), TokioReceiver(rx))
     }
 
-    fn spawn_task<T>(&self, id: ActorId, task: T) -> Self::JoinHandle<T::Output>
+    fn spawn_task<T>(&self, id: ActoId, task: T) -> Self::ActoHandle<T::Output>
     where
         T: std::future::Future + Send + 'static,
         T::Output: Send + 'static,
@@ -62,6 +63,7 @@ impl ActoRuntime for TokioActor {
     }
 }
 
+#[doc(hidden)]
 pub struct TokioSender<M>(mpsc::Sender<M>);
 impl<M: Send + 'static> Sender<M> for TokioSender<M> {
     fn send(&self, msg: M) -> Result<(), M> {
@@ -73,6 +75,7 @@ impl<M: Send + 'static> Sender<M> for TokioSender<M> {
     }
 }
 
+#[doc(hidden)]
 pub struct TokioReceiver<M>(mpsc::Receiver<M>);
 impl<M: Send + 'static> Receiver<M> for TokioReceiver<M> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<M> {
@@ -80,11 +83,12 @@ impl<M: Send + 'static> Receiver<M> for TokioReceiver<M> {
     }
 }
 
-pub struct TokioJoinHandle<O>(ActorId, tokio::task::JoinHandle<O>);
-impl<O: Send + 'static> JoinHandle for TokioJoinHandle<O> {
+#[doc(hidden)]
+pub struct TokioJoinHandle<O>(ActoId, tokio::task::JoinHandle<O>);
+impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     type Output = O;
 
-    fn id(&self) -> ActorId {
+    fn id(&self) -> ActoId {
         self.0
     }
 
@@ -101,8 +105,8 @@ impl<O: Send + 'static> JoinHandle for TokioJoinHandle<O> {
 
 #[cfg(test)]
 mod tests {
-    use super::TokioActor;
-    use crate::{join, ActoRuntime, ActorId, RecvResult};
+    use super::ActoTokio;
+    use crate::{join, ActoId, ActoInput, ActoRuntime};
     use std::{
         collections::BTreeMap,
         sync::{
@@ -117,7 +121,7 @@ mod tests {
     #[test]
     fn run() {
         let rt = Runtime::new().unwrap();
-        let sys = TokioActor::new(rt.handle(), "test");
+        let sys = ActoTokio::new(rt.handle(), "test");
         let flag = Arc::new(AtomicBool::new(false));
         let flag2 = flag.clone();
         let (r, j) = sys.spawn_actor(|mut ctx| async move {
@@ -141,24 +145,24 @@ mod tests {
             .with_env_filter(EnvFilter::builder().parse("trace").unwrap())
             .init();
         let rt = Runtime::new().unwrap();
-        let sys = TokioActor::new(rt.handle(), "test");
+        let sys = ActoTokio::new(rt.handle(), "test");
         let (r, j) = sys.spawn_actor(|mut ctx| async move {
             let mut v: Vec<i32> = vec![];
-            let mut running = BTreeMap::<ActorId, (i32, oneshot::Sender<()>)>::new();
+            let mut running = BTreeMap::<ActoId, (i32, oneshot::Sender<()>)>::new();
             loop {
                 match ctx.recv().await {
-                    RecvResult::NoMoreSenders => break,
-                    RecvResult::Supervision(id, x) => {
+                    ActoInput::NoMoreSenders => break,
+                    ActoInput::Supervision(id, x) => {
                         let (arg, tx) = running.remove(&id).unwrap();
                         let res = x.downcast::<Result<i32, i32>>().unwrap();
                         v.push(arg);
                         v.push(res.unwrap_or_else(|x| x));
                         tx.send(()).unwrap();
                     }
-                    RecvResult::Message((x, tx)) => {
+                    ActoInput::Message((x, tx)) => {
                         v.push(x);
                         let r = ctx.spawn_supervised(|mut ctx| async move {
-                            if let RecvResult::Message(x) = ctx.recv().await {
+                            if let ActoInput::Message(x) = ctx.recv().await {
                                 Ok(2 * x)
                             } else {
                                 Err(5)
