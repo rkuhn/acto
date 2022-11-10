@@ -12,7 +12,7 @@ categories = ["concurrency"]
 
 [dependencies]
 parking_lot = "0.12.1"
-tokio = { version = "1", features = ["rt", "sync"], optional = true }
+tokio = { version = "1.21", features = ["rt", "sync"], optional = true }
 tracing = "0.1.37"
 
 [dev-dependencies]

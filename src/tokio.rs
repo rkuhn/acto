@@ -96,6 +96,10 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
         self.1.abort();
     }
 
+    fn is_finished(&mut self) -> bool {
+        self.1.is_finished()
+    }
+
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
         Pin::new(&mut self.1)
             .poll(cx)

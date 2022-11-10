@@ -7,7 +7,7 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -26,6 +26,7 @@ struct ActoRefInner<M, S: ?Sized> {
     id: ActoId,
     // FIXME add reference to ActoRuntime somehow
     count: AtomicUsize,
+    dead: AtomicBool,
     waker: Mutex<Option<Waker>>,
     _ph: PhantomData<M>,
     sender: S,
@@ -61,6 +62,15 @@ impl<M> ActoRef<M> {
     /// The [`ActoId`] of the referenced actor.
     pub fn id(&self) -> ActoId {
         self.0.id
+    }
+
+    /// Check whether the referenced actor is in principle still ready to receive messages.
+    ///
+    /// Note that this is not the same as [`ActoHandle::is_finished`], which checks whether
+    /// the actor’s task is done. An actor could drop its [`ActoCell`] (yielding `true` here)
+    /// or it could move it to another async task (yielding `true` from `ActoHandle`).
+    pub fn is_gone(&self) -> bool {
+        self.0.dead.load(Ordering::Acquire)
     }
 }
 
@@ -118,6 +128,7 @@ impl<M: Send + 'static, R: ActoRuntime> Drop for ActoCell<M, R> {
         for mut h in self.supervised.drain(..) {
             h.abort();
         }
+        self.me.0.dead.store(true, Ordering::Release);
     }
 }
 
@@ -334,6 +345,7 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
         let inner = ActoRefInner {
             id,
             count: AtomicUsize::new(0),
+            dead: AtomicBool::new(false),
             waker: Mutex::new(None),
             _ph: PhantomData,
             sender,
@@ -368,14 +380,28 @@ pub trait Receiver<M>: Send + 'static {
 /// A handle for aborting or joining a running actor.
 pub trait ActoHandle: Unpin + Send + Sync + 'static {
     type Output;
+
     /// The ID of the underlying actor.
     fn id(&self) -> ActoId;
+
     /// Abort the actor’s task.
     ///
     /// Behaviour is undefined if the actor is not [cancellation safe].
     ///
     /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
     fn abort(&mut self);
+
+    /// Check whether the actor’s task is no longer running
+    ///
+    /// This may be the case even after [`ActoHandle::abort`] has returned, since task
+    /// termination may be asynchronous.
+    ///
+    /// Note that this is not the same as [`ActoRef::is_gone`], which checks whether
+    /// the actor is still capable of receiving messages. An actor could drop its
+    /// [`ActoCell`] (yielding `true` there) or it could move it to another async task
+    /// (yielding `true` here).
+    fn is_finished(&mut self) -> bool;
+
     /// Poll this handle for whether the actor is now terminated.
     ///
     /// This method has [`Future`] semantics.
@@ -411,6 +437,10 @@ where
 
     fn abort(&mut self) {
         self.0.abort()
+    }
+
+    fn is_finished(&mut self) -> bool {
+        self.0.is_finished()
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxErr>> {

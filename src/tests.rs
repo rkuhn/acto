@@ -1,5 +1,5 @@
-use crate::{join, tokio::ActoTokio, ActoCell, ActoInput, ActoRuntime};
-use std::sync::Arc;
+use crate::{join, tokio::ActoTokio, ActoCell, ActoHandle, ActoInput, ActoRuntime};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 
 #[test]
@@ -33,4 +33,28 @@ fn supervisor_termination() {
     let msg = rt.block_on(join(j)).unwrap();
     assert_eq!(msg, ActoInput::Message(()));
     assert_eq!(Arc::strong_count(&probe), 1);
+}
+
+#[test]
+fn termination_info() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sys = ActoTokio::new(rt.handle(), "test");
+    let (r, mut j) = sys.spawn_actor(|mut cell: ActoCell<(), _>| async move {
+        loop {
+            cell.recv().await;
+        }
+    });
+    assert!(!r.is_gone());
+    assert!(!j.is_finished());
+    j.abort();
+    let mut cycles = 30;
+    while cycles > 0 {
+        std::thread::sleep(Duration::from_millis(100));
+        if j.is_finished() {
+            break;
+        }
+        cycles -= 1;
+    }
+    assert!(cycles > 0);
+    assert!(r.is_gone());
 }
