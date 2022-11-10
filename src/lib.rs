@@ -13,3 +13,6 @@ pub use actor::{
     join, ActoCell, ActoHandle, ActoId, ActoInput, ActoRef, ActoRuntime, Receiver, Sender,
     SupervisionRef,
 };
+
+#[cfg(test)]
+mod tests;

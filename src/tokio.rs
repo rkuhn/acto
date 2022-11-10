@@ -92,7 +92,7 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
         self.0
     }
 
-    fn abort(self) {
+    fn abort(&mut self) {
         self.1.abort();
     }
 

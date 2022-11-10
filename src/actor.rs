@@ -99,6 +99,8 @@ impl<M> Debug for ActoRef<M> {
     }
 }
 
+type BoxErr = Box<dyn Any + Send + 'static>;
+
 /// The confines of an actor, and the engine that makes it work.
 ///
 /// Every actor is provided with an `ActoCell` when it is started, which is its
@@ -109,6 +111,14 @@ pub struct ActoCell<M: Send + 'static, R: ActoRuntime> {
     recv: R::Receiver<M>,
     supervised: Vec<Box<dyn ActoHandle<Output = ()>>>,
     no_senders_signaled: bool,
+}
+
+impl<M: Send + 'static, R: ActoRuntime> Drop for ActoCell<M, R> {
+    fn drop(&mut self) {
+        for mut h in self.supervised.drain(..) {
+            h.abort();
+        }
+    }
 }
 
 impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
@@ -235,9 +245,53 @@ pub enum ActoInput<M> {
     /// Use downcasting to acquire the output value emitted by the actor’s Future.
     /// Depending on the runtime, the box may instead contain the value with which
     /// the actor panicked.
-    Supervision(ActoId, Box<dyn Any + Send + 'static>),
+    Supervision(ActoId, BoxErr),
     /// A message has been received via our [`ActoRef`] handle.
     Message(M),
+}
+
+impl<M> ActoInput<M> {
+    pub fn is_sender_gone(&self) -> bool {
+        matches!(self, ActoInput::NoMoreSenders)
+    }
+
+    pub fn is_supervision(&self) -> bool {
+        matches!(self, ActoInput::Supervision(_, _))
+    }
+
+    pub fn is_message(&self) -> bool {
+        matches!(self, ActoInput::Message(_))
+    }
+
+    /// Obtain input message or supervision unless this is [`ActoInput::NoMoreSenders`].
+    ///
+    /// ```rust
+    /// use acto::{ActoCell, ActoRuntime};
+    ///
+    /// async fn actor(mut cell: ActoCell<String, impl ActoRuntime>) {
+    ///     while let Some(input) = cell.recv().await.into_value() {
+    ///         // do something with it
+    ///     }
+    ///     // actor automatically stops when all senders are gone
+    /// }
+    /// ```
+    pub fn into_value(self) -> Option<Result<M, (ActoId, BoxErr)>> {
+        match self {
+            ActoInput::NoMoreSenders => None,
+            ActoInput::Supervision(id, res) => Some(Err((id, res))),
+            ActoInput::Message(msg) => Some(Ok(msg)),
+        }
+    }
+}
+
+impl<M: PartialEq> PartialEq for ActoInput<M> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Supervision(l0, _), Self::Supervision(r0, _)) => l0 == r0,
+            (Self::Message(l0), Self::Message(r0)) => l0 == r0,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
+    }
 }
 
 /// For implementors: the interface of a runtime for operating actors.
@@ -321,26 +375,21 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
     /// Behaviour is undefined if the actor is not [cancellation safe].
     ///
     /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
-    fn abort(self);
+    fn abort(&mut self);
     /// Poll this handle for whether the actor is now terminated.
     ///
     /// This method has [`Future`] semantics.
-    fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Self::Output, Box<dyn Any + Send + 'static>>>;
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Output, BoxErr>>;
 }
 
 /// A future for awaiting the termination of the actor underlying the given handle.
-pub fn join<J: ActoHandle>(
-    handle: J,
-) -> impl Future<Output = Result<J::Output, Box<dyn Any + Send + 'static>>> {
+pub fn join<J: ActoHandle>(handle: J) -> impl Future<Output = Result<J::Output, BoxErr>> {
     ActoHandleFuture(handle)
 }
 
 struct ActoHandleFuture<J>(J);
 impl<J: ActoHandle> Future for ActoHandleFuture<J> {
-    type Output = Result<J::Output, Box<dyn Any + Send + 'static>>;
+    type Output = Result<J::Output, BoxErr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         tracing::trace!(join = ?self.as_ref().0.id(), "poll");
@@ -360,13 +409,13 @@ where
         self.0.id()
     }
 
-    fn abort(self) {
+    fn abort(&mut self) {
         self.0.abort()
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Box<dyn Any + Send + 'static>>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxErr>> {
         self.0
             .poll(cx)
-            .map(|r| r.and_then(|x| Err(Box::new(x) as Box<dyn Any + Send + 'static>)))
+            .map(|r| r.and_then(|x| Err(Box::new(x) as BoxErr)))
     }
 }
