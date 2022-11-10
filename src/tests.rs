@@ -2,6 +2,16 @@ use crate::{join, tokio::ActoTokio, ActoCell, ActoHandle, ActoInput, ActoRuntime
 use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 
+macro_rules! assert_timed {
+    ($cond:expr $(,$($arg:tt)+)?) => {
+        for _ in 0..300 {
+            std::thread::sleep(Duration::from_millis(10));
+            if $cond { break; }
+        }
+        assert!($cond $(,$($arg)*)?);
+    };
+}
+
 #[test]
 fn supervisor_termination() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -32,7 +42,11 @@ fn supervisor_termination() {
     r.send(()).ok();
     let msg = rt.block_on(join(j)).unwrap();
     assert_eq!(msg, ActoInput::Message(()));
-    assert_eq!(Arc::strong_count(&probe), 1);
+    assert_timed!(
+        Arc::strong_count(&probe) == 1,
+        " was {}",
+        Arc::strong_count(&probe)
+    );
 }
 
 #[test]
@@ -47,14 +61,6 @@ fn termination_info() {
     assert!(!r.is_gone());
     assert!(!j.is_finished());
     j.abort();
-    let mut cycles = 30;
-    while cycles > 0 {
-        std::thread::sleep(Duration::from_millis(100));
-        if j.is_finished() {
-            break;
-        }
-        cycles -= 1;
-    }
-    assert!(cycles > 0);
+    assert_timed!(j.is_finished());
     assert!(r.is_gone());
 }

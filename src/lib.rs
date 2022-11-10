@@ -2,7 +2,7 @@
 //!
 //! Currently in early alpha stage: supports tokio for execution, currently only uses the MPSC channel, and still is quite slow.
 
-#![cfg_attr(doc, feature(doc_auto_cfg))]
+#![cfg_attr(all(doc, CHANNEL_NIGHTLY), feature(doc_auto_cfg))]
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
