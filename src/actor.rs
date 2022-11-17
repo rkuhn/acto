@@ -5,7 +5,7 @@ use std::{
     fmt::Debug,
     future::{poll_fn, Future},
     hash::Hash,
-    marker::PhantomData,
+    mem::ManuallyDrop,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -21,16 +21,37 @@ pub struct ActoId(usize);
 /// A handle for sending messages to an actor.
 ///
 /// You may freely clone or share this handle and store it in collections.
-pub struct ActoRef<M>(Arc<ActoRefInner<M, dyn Sender<M>>>);
+pub struct ActoRef<M>(Arc<ActoRefInner<dyn Sender<M>>>);
 
-struct ActoRefInner<M, S: ?Sized> {
+struct ActoRefInner<S: ?Sized> {
+    mapped: bool,
+    fields: Inner,
     id: ActoId,
+    sender: S,
+}
+
+union Inner {
+    straight: ManuallyDrop<Straight>,
+    mapped: ManuallyDrop<Mapped>,
+}
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
+
+struct Straight {
     name: SmolStr,
     count: AtomicUsize,
     dead: AtomicBool,
     waker: Mutex<Option<Waker>>,
-    _ph: PhantomData<M>,
-    sender: S,
+}
+
+/// safety: the pointers are guaranteed to not be dangling because the
+/// associated `sender` holds a strong reference to the Arc providing them.
+#[derive(Clone, Copy)]
+struct Mapped {
+    name: *const str,
+    count: *const AtomicUsize,
+    dead: *const AtomicBool,
+    waker: *const Mutex<Option<Waker>>,
 }
 
 impl<T, U> PartialEq<ActoRef<U>> for ActoRef<T> {
@@ -67,7 +88,35 @@ impl<M> ActoRef<M> {
 
     /// The actor’s given name plus ActoRuntime name and ActoId.
     pub fn name(&self) -> &str {
-        &self.0.name
+        if self.0.mapped {
+            unsafe { &*self.0.fields.mapped.name }
+        } else {
+            unsafe { &self.0.fields.straight.name }
+        }
+    }
+
+    fn count(&self) -> &AtomicUsize {
+        if self.0.mapped {
+            unsafe { &*self.0.fields.mapped.count }
+        } else {
+            unsafe { &self.0.fields.straight.count }
+        }
+    }
+
+    fn dead(&self) -> &AtomicBool {
+        if self.0.mapped {
+            unsafe { &*self.0.fields.mapped.dead }
+        } else {
+            unsafe { &self.0.fields.straight.dead }
+        }
+    }
+
+    fn waker(&self) -> &Mutex<Option<Waker>> {
+        if self.0.mapped {
+            unsafe { &*self.0.fields.mapped.waker }
+        } else {
+            unsafe { &self.0.fields.straight.waker }
+        }
     }
 
     /// Check whether the referenced actor is in principle still ready to receive messages.
@@ -76,7 +125,7 @@ impl<M> ActoRef<M> {
     /// the actor’s task is done. An actor could drop its [`ActoCell`] (yielding `true` here)
     /// or it could move it to another async task (yielding `true` from `ActoHandle`).
     pub fn is_gone(&self) -> bool {
-        self.0.dead.load(Ordering::Acquire)
+        self.dead().load(Ordering::Acquire)
     }
 }
 
@@ -84,27 +133,78 @@ impl<M: Send + 'static> ActoRef<M> {
     /// Send a message to the referenced actor.
     ///
     /// The employed channel may be at its capacity bound and the target actor may
-    /// already be terminated, in which cases the message is returned in an `Err`.
-    pub fn send(&self, msg: M) -> Result<(), M> {
+    /// already be terminated, in which cases the message is dropped and `false` is
+    /// returned.
+    pub fn send(&self, msg: M) -> bool {
         tracing::trace!(target = ?self, "send");
         self.0.sender.send(msg)
+    }
+
+    /// Derive an ActoRef accepting a different type of message, typically embedded in an `enum`.
+    ///
+    /// ```rust
+    /// # use acto::{ActoTokio, ActoRuntime, ActoCell, ActoInput, spawn_actor};
+    /// use tokio::sync::oneshot;
+    /// async fn actor(mut cell: ActoCell<Option<oneshot::Sender<i32>>, impl ActoRuntime>) {
+    ///     while let ActoInput::Message(Some(channel)) = cell.recv().await {
+    ///         channel.send(42).ok();
+    ///     }
+    /// }
+    /// let rt = ActoTokio::new("test", 1).unwrap();
+    /// let ar = spawn_actor(&rt, "a", actor).me.contramap(|msg| Some(msg));
+    /// let (tx, rx) = oneshot::channel();
+    /// ar.send(tx);
+    /// # let response = rt.rt().block_on(rx).unwrap();
+    /// # assert_eq!(response, 42);
+    /// ```
+    pub fn contramap<M2>(&self, f: impl Fn(M2) -> M + Send + Sync + 'static) -> ActoRef<M2> {
+        let mapped = if self.0.mapped {
+            unsafe { self.0.fields.mapped }
+        } else {
+            unsafe {
+                ManuallyDrop::new(Mapped {
+                    name: self.0.fields.straight.name.as_str(),
+                    count: &self.0.fields.straight.count,
+                    dead: &self.0.fields.straight.dead,
+                    waker: &self.0.fields.straight.waker,
+                })
+            }
+        };
+        let ar = self.clone();
+        let inner = ActoRefInner {
+            mapped: true,
+            fields: Inner { mapped },
+            id: self.0.id,
+            sender: move |msg| ar.0.sender.send(f(msg)),
+        };
+        ActoRef(Arc::new(inner))
     }
 }
 
 impl<M> Clone for ActoRef<M> {
     fn clone(&self) -> Self {
-        self.0.count.fetch_add(1, Ordering::Relaxed);
+        self.count().fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl<M> Drop for ActoRef<M> {
     fn drop(&mut self) {
-        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
-            let waker = self.0.waker.lock().take();
+        if self.count().fetch_sub(1, Ordering::Relaxed) == 1 {
+            let waker = self.waker().lock().take();
             if let Some(waker) = waker {
                 waker.wake();
             }
+        }
+    }
+}
+
+impl<S: ?Sized> Drop for ActoRefInner<S> {
+    fn drop(&mut self) {
+        if self.mapped {
+            unsafe { ManuallyDrop::drop(&mut self.fields.mapped) };
+        } else {
+            unsafe { ManuallyDrop::drop(&mut self.fields.straight) };
         }
     }
 }
@@ -134,7 +234,7 @@ impl<M: Send + 'static, R: ActoRuntime> Drop for ActoCell<M, R> {
         for mut h in self.supervised.drain(..) {
             h.abort();
         }
-        self.me.0.dead.store(true, Ordering::Release);
+        self.me.dead().store(true, Ordering::Release);
     }
 }
 
@@ -164,7 +264,7 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
                 tracing::trace!(me = ?self.me.name(), "message");
                 return Poll::Ready(ActoInput::Message(msg));
             }
-            if self.me.0.count.load(Ordering::Relaxed) == 0 {
+            if self.me.count().load(Ordering::Relaxed) == 0 {
                 tracing::trace!(me = ?self.me.name(), "no sender");
                 if !self.no_senders_signaled {
                     self.no_senders_signaled = true;
@@ -172,9 +272,9 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
                 }
             } else if !self.no_senders_signaled {
                 // only install waker if we’re interested in emitting NoMoreSenders
-                *self.me.0.waker.lock() = Some(cx.waker().clone());
+                *self.me.waker().lock() = Some(cx.waker().clone());
                 // re-check in case last ref was dropped between check and lock
-                if self.me.0.count.load(Ordering::Relaxed) == 0 {
+                if self.me.count().load(Ordering::Relaxed) == 0 {
                     tracing::trace!(me = ?self.me.name(), "no sender");
                     self.no_senders_signaled = true;
                     return Poll::Ready(ActoInput::NoMoreSenders);
@@ -201,7 +301,7 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
     ///     }).me;
     ///     // spawn and let some other actor supervise
     ///     let s_ref = cell.spawn("other", |cell: ActoCell<i32, _>| async move { todo!() });
-    ///     a_ref.send(s_ref).ok();
+    ///     a_ref.send(s_ref);
     /// }
     /// ```
     pub fn spawn<T: Send + 'static, F, Fut>(
@@ -372,11 +472,15 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
         let name2 = name.clone();
         let inner = ActoRefInner {
             id,
-            name,
-            count: AtomicUsize::new(0),
-            dead: AtomicBool::new(false),
-            waker: Mutex::new(None),
-            _ph: PhantomData,
+            mapped: false,
+            fields: Inner {
+                straight: ManuallyDrop::new(Straight {
+                    name,
+                    count: AtomicUsize::new(0),
+                    dead: AtomicBool::new(false),
+                    waker: Mutex::new(None),
+                }),
+            },
             sender,
         };
         let me = ActoRef(Arc::new(inner));
@@ -421,7 +525,13 @@ fn test_write_id() {
 ///
 /// This type is used between a runtime implementation and `acto`.
 pub trait Sender<M>: Send + Sync + 'static {
-    fn send(&self, msg: M) -> Result<(), M>;
+    fn send(&self, msg: M) -> bool;
+}
+
+impl<M, F: Fn(M) -> bool + Send + Sync + 'static> Sender<M> for F {
+    fn send(&self, msg: M) -> bool {
+        (self)(msg)
+    }
 }
 
 /// A named closure for receiving messages at a given actor.

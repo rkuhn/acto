@@ -14,7 +14,10 @@ macro_rules! assert_timed {
 
 #[test]
 fn supervisor_termination() {
-    tracing_subscriber::fmt().with_env_filter("trace").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("trace")
+        .with_writer(std::io::stdout)
+        .init();
     let sys = ActoTokio::new("test", 2).unwrap();
 
     let probe = Arc::new(());
@@ -40,7 +43,7 @@ fn supervisor_termination() {
     sys.rt().block_on(rx).unwrap();
     assert_eq!(Arc::strong_count(&probe), 4);
 
-    r.send(()).ok();
+    r.send(());
     let msg = sys.rt().block_on(join(j)).unwrap();
     assert_eq!(msg, ActoInput::Message(()));
     assert_timed!(

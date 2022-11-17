@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::{
     runtime::{Builder, Runtime},
-    sync::mpsc::{self, error::TrySendError},
+    sync::mpsc,
 };
 
 /// An [`ActoRuntime`] based on [`tokio::runtime`] and [`tokio::sync::mpsc`] queues.
@@ -76,12 +76,8 @@ impl ActoRuntime for ActoTokio {
 
 pub struct TokioSender<M>(mpsc::Sender<M>);
 impl<M: Send + 'static> Sender<M> for TokioSender<M> {
-    fn send(&self, msg: M) -> Result<(), M> {
-        match self.0.try_send(msg) {
-            Ok(_) => Ok(()),
-            Err(TrySendError::Closed(m)) => Err(m),
-            Err(TrySendError::Full(m)) => Err(m),
-        }
+    fn send(&self, msg: M) -> bool {
+        self.0.try_send(msg).is_ok()
     }
 }
 
@@ -146,7 +142,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(100));
         assert!(flag.load(Ordering::Relaxed));
-        r.send(()).unwrap();
+        r.send(());
         std::thread::sleep(Duration::from_millis(100));
         assert!(!flag.load(Ordering::Relaxed));
         let ret = sys.rt().block_on(join(j));
@@ -178,7 +174,7 @@ mod tests {
                                 Err(5)
                             }
                         });
-                        r.send(x).unwrap();
+                        r.send(x);
                         running.insert(r.id(), (x, tx));
                     }
                 }
@@ -186,10 +182,10 @@ mod tests {
             v
         });
         let (tx, rx) = oneshot::channel();
-        r.send((1, tx)).unwrap();
+        r.send((1, tx));
         sys.rt().block_on(rx).unwrap();
         let (tx, rx) = oneshot::channel();
-        r.send((2, tx)).unwrap();
+        r.send((2, tx));
         sys.rt().block_on(rx).unwrap();
         drop(r);
         let v = sys.rt().block_on(join(j)).unwrap();
