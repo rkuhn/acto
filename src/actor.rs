@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
+use smol_str::SmolStr;
 use std::{
     any::Any,
-    fmt::{Debug, Write},
+    fmt::Debug,
     future::{poll_fn, Future},
     hash::Hash,
     marker::PhantomData,
@@ -24,7 +25,7 @@ pub struct ActoRef<M>(Arc<ActoRefInner<M, dyn Sender<M>>>);
 
 struct ActoRefInner<M, S: ?Sized> {
     id: ActoId,
-    // FIXME add reference to ActoRuntime somehow
+    name: SmolStr,
     count: AtomicUsize,
     dead: AtomicBool,
     waker: Mutex<Option<Waker>>,
@@ -62,6 +63,11 @@ impl<M> ActoRef<M> {
     /// The [`ActoId`] of the referenced actor.
     pub fn id(&self) -> ActoId {
         self.0.id
+    }
+
+    /// The actor’s given name plus ActoRuntime name and ActoId.
+    pub fn name(&self) -> &str {
+        &self.0.name
     }
 
     /// Check whether the referenced actor is in principle still ready to receive messages.
@@ -105,7 +111,7 @@ impl<M> Drop for ActoRef<M> {
 
 impl<M> Debug for ActoRef<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("ActorRef").field(&self.0.id.0).finish()
+        write!(f, "ActorRef({})", self.name())
     }
 }
 
@@ -150,16 +156,16 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
                 let p = self.supervised[idx].poll(cx);
                 if let Poll::Ready(x) = p {
                     let handle = self.supervised.remove(idx);
-                    tracing::trace!(me = ?self.me.id(), src = ?handle.id(), "supervision");
+                    tracing::trace!(me = ?self.me.name(), src = ?handle.name(), "supervision");
                     return Poll::Ready(ActoInput::Supervision(handle.id(), x.unwrap_err()));
                 }
             }
             if let Poll::Ready(msg) = self.recv.poll(cx) {
-                tracing::trace!(me = ?self.me.id(), "message");
+                tracing::trace!(me = ?self.me.name(), "message");
                 return Poll::Ready(ActoInput::Message(msg));
             }
             if self.me.0.count.load(Ordering::Relaxed) == 0 {
-                tracing::trace!(me = ?self.me.id(), "no sender");
+                tracing::trace!(me = ?self.me.name(), "no sender");
                 if !self.no_senders_signaled {
                     self.no_senders_signaled = true;
                     return Poll::Ready(ActoInput::NoMoreSenders);
@@ -169,12 +175,12 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
                 *self.me.0.waker.lock() = Some(cx.waker().clone());
                 // re-check in case last ref was dropped between check and lock
                 if self.me.0.count.load(Ordering::Relaxed) == 0 {
-                    tracing::trace!(me = ?self.me.id(), "no sender");
+                    tracing::trace!(me = ?self.me.name(), "no sender");
                     self.no_senders_signaled = true;
                     return Poll::Ready(ActoInput::NoMoreSenders);
                 }
             }
-            tracing::trace!(me = ?self.me.id(), "nothing");
+            tracing::trace!(me = ?self.me.name(), "Poll::Pending");
             Poll::Pending
         })
     }
@@ -186,48 +192,58 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
     ///
     /// async fn actor<M: Send + 'static, R: ActoRuntime>(cell: ActoCell<M, R>) {
     ///     // spawn and forget
-    ///     cell.spawn(|cell: ActoCell<i32, _>| async move { todo!() });
+    ///     cell.spawn("name", |cell: ActoCell<i32, _>| async move { todo!() });
     ///     // spawn, retrieve handle, do not supervise
-    ///     let a_ref = cell.spawn(|mut cell| async move {
+    ///     let a_ref = cell.spawn("super", |mut cell| async move {
     ///         if let ActoInput::Message(msg) = cell.recv().await {
     ///             cell.supervise(msg);
     ///         }
     ///     }).me;
     ///     // spawn and let some other actor supervise
-    ///     let s_ref = cell.spawn(|cell: ActoCell<i32, _>| async move { todo!() });
+    ///     let s_ref = cell.spawn("other", |cell: ActoCell<i32, _>| async move { todo!() });
     ///     a_ref.send(s_ref).ok();
     /// }
     /// ```
-    pub fn spawn<T: Send + 'static, F, Fut>(&self, actor: F) -> SupervisionRef<T, R, Fut::Output>
+    pub fn spawn<T: Send + 'static, F, Fut>(
+        &self,
+        name: &str,
+        actor: F,
+    ) -> SupervisionRef<T, R::ActoHandle<Fut::Output>>
     where
         F: FnOnce(ActoCell<T, R>) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let (me, join) = self.runtime.spawn_actor(actor);
-        tracing::trace!(me = ?self.me.id(), new = ?me.id(), "spawn");
+        let (me, join) = self.runtime.spawn_actor(name, actor);
+        tracing::trace!(me = ?self.me.name(), new = ?me.name(), "spawn");
         SupervisionRef { me, join }
     }
 
     /// Create a new actor on the same [`ActoRuntime`] as the current one and [`ActoCell::supervise`] it.
-    pub fn spawn_supervised<T: Send + 'static, F, Fut>(&mut self, actor: F) -> ActoRef<T>
+    pub fn spawn_supervised<T: Send + 'static, F, Fut>(
+        &mut self,
+        name: &str,
+        actor: F,
+    ) -> ActoRef<T>
     where
         F: FnOnce(ActoCell<T, R>) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        self.supervise(self.spawn(actor))
+        self.supervise(self.spawn(name, actor))
     }
 
     /// Supervise another actor.
     ///
     /// When that actor terminates, this actor will receive [`ActoInput::Supervision`] for it.
     /// When this actor terminates, all supervised actors will be aborted.
-    pub fn supervise<T: Send + 'static, R2: ActoRuntime, O: Send + 'static>(
-        &mut self,
-        actor: SupervisionRef<T, R2, O>,
-    ) -> ActoRef<T> {
-        tracing::trace!(me = ?self.me.id(), target = ?actor.me.id(), "supervise");
+    pub fn supervise<T, H>(&mut self, actor: SupervisionRef<T, H>) -> ActoRef<T>
+    where
+        T: Send + 'static,
+        H: ActoHandle + Send + 'static,
+        H::Output: Send + 'static,
+    {
+        tracing::trace!(me = ?self.me.name(), target = ?actor.me.name(), "supervise");
         self.supervised.push(Box::new(ActoHandleBox(actor.join)));
         actor.me
     }
@@ -236,9 +252,9 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
 /// A package of an actor’s [`ActoRef`] and [`ActoHandle`].
 ///
 /// This is the result of [`ActoCell::spawn`] and can be passed to [`ActoCell::supervise`].
-pub struct SupervisionRef<M, R: ActoRuntime, O: Send + 'static> {
+pub struct SupervisionRef<M, H> {
     pub me: ActoRef<M>,
-    pub join: R::ActoHandle<O>,
+    pub join: H,
 }
 
 /// Actor input as received with [`ActoCell::recv`].
@@ -306,6 +322,8 @@ impl<M: PartialEq> PartialEq for ActoInput<M> {
 }
 
 /// For implementors: the interface of a runtime for operating actors.
+///
+/// Cloning a runtime should be cheap, it SHOULD be using the `Arc<Inner>` pattern.
 pub trait ActoRuntime: Clone + Send + Sync + 'static {
     /// The type of handle used for joining the actor’s task.
     type ActoHandle<O: Send + 'static>: ActoHandle<Output = O>;
@@ -315,7 +333,7 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
     type Receiver<M: Send + 'static>: Receiver<M>;
 
     /// A name for this runtime, used mainly in logging.
-    fn fmt(&self, f: &mut impl Write) -> std::fmt::Result;
+    fn name(&self) -> &str;
 
     /// The next ID to be assigned to a fresh actor.
     fn next_id(&self) -> usize;
@@ -325,7 +343,7 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
 
     /// Spawn an actor’s task to be driven independently and return an [`ActoHandle`]
     /// to abort or join it.
-    fn spawn_task<T>(&self, id: ActoId, task: T) -> Self::ActoHandle<T::Output>
+    fn spawn_task<T>(&self, id: ActoId, name: SmolStr, task: T) -> Self::ActoHandle<T::Output>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static;
@@ -333,7 +351,11 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
     /// Provided function for spawning actors.
     ///
     /// Uses the above utilities and cannot be implemented by downstream crates.
-    fn spawn_actor<T, F, Fut>(&self, actor: F) -> (ActoRef<T>, Self::ActoHandle<Fut::Output>)
+    fn spawn_actor<T, F, Fut>(
+        &self,
+        name: &str,
+        actor: F,
+    ) -> (ActoRef<T>, Self::ActoHandle<Fut::Output>)
     where
         T: Send + 'static,
         F: FnOnce(ActoCell<T, Self>) -> Fut,
@@ -342,8 +364,15 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
     {
         let (sender, recv) = self.mailbox();
         let id = ActoId(self.next_id());
+        let mut id_str = [0u8; 16];
+        let id_str = write_id(&mut id_str, id);
+        let name = [name, "(", self.name(), "/", id_str, ")"]
+            .into_iter()
+            .collect::<SmolStr>();
+        let name2 = name.clone();
         let inner = ActoRefInner {
             id,
+            name,
             count: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
             waker: Mutex::new(None),
@@ -358,9 +387,34 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
             supervised: vec![],
             no_senders_signaled: false,
         };
-        let handle = self.spawn_task(id, (actor)(ctx));
+        let handle = self.spawn_task(id, name2, (actor)(ctx));
         (me, handle)
     }
+}
+
+fn write_id(buf: &mut [u8; 16], id: ActoId) -> &str {
+    let id = id.0;
+    if id == 0 {
+        return "0";
+    }
+    let mut written = 0;
+    let mut shift = (16 - (id.leading_zeros()) / 4) * 4;
+    while shift != 0 {
+        shift -= 4;
+        const HEX: [u8; 16] = *b"0123456789abcdef";
+        buf[written] = HEX[(id >> shift) & 15];
+        written += 1;
+    }
+    unsafe { std::str::from_utf8_unchecked(&buf[..written]) }
+}
+
+#[test]
+fn test_write_id() {
+    let mut buf = [0u8; 16];
+    assert_eq!(write_id(&mut buf, ActoId(0)), "0");
+    assert_eq!(write_id(&mut buf, ActoId(1)), "1");
+    assert_eq!(write_id(&mut buf, ActoId(10)), "a");
+    assert_eq!(write_id(&mut buf, ActoId(100)), "64");
 }
 
 /// A named closure for sending messages to a given actor.
@@ -383,6 +437,9 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
 
     /// The ID of the underlying actor.
     fn id(&self) -> ActoId;
+
+    /// The name of the underlying actor.
+    fn name(&self) -> &str;
 
     /// Abort the actor’s task.
     ///
@@ -418,7 +475,7 @@ impl<J: ActoHandle> Future for ActoHandleFuture<J> {
     type Output = Result<J::Output, BoxErr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        tracing::trace!(join = ?self.as_ref().0.id(), "poll");
+        tracing::trace!(join = ?self.as_ref().0.name(), "poll");
         self.get_mut().0.poll(cx)
     }
 }
@@ -433,6 +490,10 @@ where
 
     fn id(&self) -> ActoId {
         self.0.id()
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
     }
 
     fn abort(&mut self) {
