@@ -4,9 +4,10 @@ version = 3
 
 [[package]]
 name = "acto"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "parking_lot",
+ "pin-project-lite",
  "rustc_version",
  "smol_str",
  "tokio",

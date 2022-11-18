@@ -1,13 +1,10 @@
-use crate::{ActoHandle, ActoId, ActoRuntime, Receiver, Sender};
+use crate::{ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender};
 use smol_str::SmolStr;
 use std::{
     any::Any,
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::{
@@ -17,9 +14,12 @@ use tokio::{
 
 /// An [`ActoRuntime`] based on [`tokio::runtime`] and [`tokio::sync::mpsc`] queues.
 #[derive(Clone)]
-pub struct ActoTokio(Arc<Inner>);
+pub struct AcTokio {
+    inner: Arc<Inner>,
+    mailbox_size: usize,
+}
 
-impl ActoTokio {
+impl AcTokio {
     pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
         let name = name.into();
         let rt = Builder::new_multi_thread()
@@ -27,41 +27,33 @@ impl ActoTokio {
             .worker_threads(num_threads)
             .enable_all()
             .build()?;
-        Ok(Self(Arc::new(Inner {
-            name,
-            id: AtomicUsize::new(1),
-            rt,
+        Ok(Self {
+            inner: Arc::new(Inner { name, rt }),
             mailbox_size: 128,
-        })))
+        })
     }
 
     pub fn rt(&self) -> &Runtime {
-        &self.0.rt
+        &self.inner.rt
     }
 }
 
 struct Inner {
     name: String,
-    id: AtomicUsize,
     rt: Runtime,
-    mailbox_size: usize,
 }
 
-impl ActoRuntime for ActoTokio {
+impl ActoRuntime for AcTokio {
     type ActoHandle<O: Send + 'static> = TokioJoinHandle<O>;
     type Sender<M: Send + 'static> = TokioSender<M>;
     type Receiver<M: Send + 'static> = TokioReceiver<M>;
 
     fn name(&self) -> &str {
-        &self.0.name
-    }
-
-    fn next_id(&self) -> usize {
-        self.0.id.fetch_add(1, Ordering::Relaxed)
+        &self.inner.name
     }
 
     fn mailbox<M: Send + 'static>(&self) -> (Self::Sender<M>, Self::Receiver<M>) {
-        let (tx, rx) = mpsc::channel(self.0.mailbox_size);
+        let (tx, rx) = mpsc::channel(self.mailbox_size);
         (TokioSender(tx), TokioReceiver(rx))
     }
 
@@ -70,7 +62,18 @@ impl ActoRuntime for ActoTokio {
         T: std::future::Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        TokioJoinHandle(id, name, self.0.rt.spawn(task))
+        TokioJoinHandle(id, name, self.inner.rt.spawn(task))
+    }
+}
+
+impl MailboxSize for AcTokio {
+    type Output = Self;
+
+    fn with_mailbox_size(&self, mailbox_size: usize) -> Self::Output {
+        Self {
+            inner: self.inner.clone(),
+            mailbox_size,
+        }
     }
 }
 
@@ -117,8 +120,8 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
 
 #[cfg(test)]
 mod tests {
-    use super::ActoTokio;
-    use crate::{join, ActoId, ActoInput, ActoRuntime};
+    use super::AcTokio;
+    use crate::{join, ActoId, ActoInput, ActoRuntime, SupervisionRef};
     use std::{
         collections::BTreeMap,
         sync::{
@@ -131,10 +134,10 @@ mod tests {
 
     #[test]
     fn run() {
-        let sys = ActoTokio::new("test", 1).unwrap();
+        let sys = AcTokio::new("test", 1).unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let flag2 = flag.clone();
-        let (r, j) = sys.spawn_actor("super", |mut ctx| async move {
+        let SupervisionRef { me: r, handle: j } = sys.spawn_actor("super", |mut ctx| async move {
             flag2.store(true, Ordering::Relaxed);
             ctx.recv().await;
             flag2.store(false, Ordering::Relaxed);
@@ -151,8 +154,8 @@ mod tests {
 
     #[test]
     fn child() {
-        let sys = ActoTokio::new("test", 2).unwrap();
-        let (r, j) = sys.spawn_actor("super", |mut ctx| async move {
+        let sys = AcTokio::new("test", 2).unwrap();
+        let SupervisionRef { me: r, handle: j } = sys.spawn_actor("super", |mut ctx| async move {
             let mut v: Vec<i32> = vec![];
             let mut running = BTreeMap::<ActoId, (i32, oneshot::Sender<()>)>::new();
             loop {

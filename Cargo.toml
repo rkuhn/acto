@@ -1,6 +1,6 @@
 [package]
 name = "acto"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Roland Kuhn <rk@rkuhn.info>"]
 edition = "2021"
 description = "light-weight Actor library for Rust"
@@ -12,6 +12,7 @@ categories = ["concurrency"]
 
 [dependencies]
 parking_lot = "0.12.1"
+pin-project-lite = "0.2.9"
 smol_str = "0.1.23"
 tokio = { version = "1.21", features = ["rt", "sync"], optional = true }
 tracing = "0.1.37"
