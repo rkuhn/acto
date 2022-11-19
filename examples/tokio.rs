@@ -11,7 +11,7 @@ async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
         let r = ctx.spawn("worker", |mut ctx| async move {
             match ctx.recv().await {
                 ActoInput::NoMoreSenders => "no send".to_owned(),
-                ActoInput::Supervision(_, _) => unreachable!(),
+                ActoInput::Supervision { .. } => unreachable!(),
                 ActoInput::Message(m) => {
                     println!("received {}", m);
                     "send".to_owned()

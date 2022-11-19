@@ -1,3 +1,4 @@
+use core::mem::discriminant;
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 use std::{
@@ -261,7 +262,12 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
                 if let Poll::Ready(x) = p {
                     let handle = self.supervised.remove(idx);
                     tracing::trace!(src = ?handle.name(), "supervision");
-                    return Poll::Ready(ActoInput::Supervision(handle.id(), x.unwrap_err()));
+                    return Poll::Ready(ActoInput::Supervision {
+                        id: handle.id(),
+                        name: handle.name().to_owned(),
+                        // ActoHandleBox wraps successes also into the Err case
+                        result: x.unwrap_err(),
+                    });
                 }
             }
             if let Poll::Ready(msg) = self.recv.poll(cx) {
@@ -359,6 +365,60 @@ pub struct SupervisionRef<M, H> {
     pub handle: H,
 }
 
+impl<M: Send + 'static, H> SupervisionRef<M, H> {
+    /// Derive a new reference by embedding the supervisor-required type `M2` into the message schema.
+    ///
+    /// ```rust
+    /// # use acto::{ActoCell, ActoInput, ActoRef, ActoRuntime, SupervisionRef};
+    /// struct Shutdown;
+    ///
+    /// enum ActorCommand {
+    ///     Shutdown(Shutdown),
+    ///     DoStuff(String),
+    /// }
+    ///
+    /// async fn top_level(mut cell: ActoCell<(), impl ActoRuntime>) {
+    ///     let supervisor = cell.spawn_supervised("super",
+    ///         |mut cell: ActoCell<SupervisionRef<Shutdown, _>, _>| async move {
+    ///             while let ActoInput::Message(actor) = cell.recv().await {
+    ///                 let actor_ref = cell.supervise(actor);
+    ///                 // use reference to shut it down at a later time
+    ///             }
+    ///             // if any of them fail, shut all of them down
+    ///         }
+    ///     );
+    ///     let actor = cell.spawn("actor", |mut cell| async move {
+    ///         while let ActoInput::Message(msg) = cell.recv().await {
+    ///             if let ActorCommand::Shutdown(_) = msg {
+    ///                 break;
+    ///             }
+    ///         }
+    ///     });
+    ///     let actor_ref = actor.me.clone();
+    ///     supervisor.send(actor.contramap(ActorCommand::Shutdown));
+    ///     // do stuff with actor_ref
+    /// }
+    /// ```
+    pub fn contramap<M2>(
+        self,
+        f: impl Fn(M2) -> M + Send + Sync + 'static,
+    ) -> SupervisionRef<M2, H> {
+        let Self { me, handle } = self;
+        let fields = match &me.0.fields {
+            Inner::Straight(s) => Inner::Mapped(s.into()),
+            Inner::Mapped(x) => Inner::Mapped(*x),
+        };
+        let id = me.id();
+        let inner = ActoRefInner {
+            fields,
+            id,
+            sender: move |msg| me.0.sender.send(f(msg)),
+        };
+        let me = ActoRef(Arc::new(inner));
+        SupervisionRef { me, handle }
+    }
+}
+
 /// Actor input as received with [`ActoCell::recv`].
 #[derive(Debug)]
 pub enum ActoInput<M> {
@@ -374,7 +434,17 @@ pub enum ActoInput<M> {
     /// Use downcasting to acquire the output value emitted by the actor’s Future.
     /// Depending on the runtime, the box may instead contain the value with which
     /// the actor panicked.
-    Supervision(ActoId, BoxErr),
+    ///
+    /// ## Important notice
+    ///
+    /// Supervision notifications are delivered as soon as possible after the
+    /// supervised actor’s task has finished. Messages sent by that actor — possibly
+    /// to the supervisor — may still be in flight at this point.
+    Supervision {
+        id: ActoId,
+        name: String,
+        result: BoxErr,
+    },
     /// A message has been received via our [`ActoRef`] handle.
     Message(M),
 }
@@ -385,7 +455,7 @@ impl<M> ActoInput<M> {
     }
 
     pub fn is_supervision(&self) -> bool {
-        matches!(self, ActoInput::Supervision(_, _))
+        matches!(self, ActoInput::Supervision { .. })
     }
 
     pub fn is_message(&self) -> bool {
@@ -404,10 +474,10 @@ impl<M> ActoInput<M> {
     ///     // actor automatically stops when all senders are gone
     /// }
     /// ```
-    pub fn into_value(self) -> Option<Result<M, (ActoId, BoxErr)>> {
+    pub fn into_value(self) -> Option<Result<M, (ActoId, String, BoxErr)>> {
         match self {
             ActoInput::NoMoreSenders => None,
-            ActoInput::Supervision(id, res) => Some(Err((id, res))),
+            ActoInput::Supervision { id, name, result } => Some(Err((id, name, result))),
             ActoInput::Message(msg) => Some(Ok(msg)),
         }
     }
@@ -416,9 +486,11 @@ impl<M> ActoInput<M> {
 impl<M: PartialEq> PartialEq for ActoInput<M> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Supervision(l0, _), Self::Supervision(r0, _)) => l0 == r0,
+            (Self::Supervision { id: left, .. }, Self::Supervision { id: right, .. }) => {
+                left == right
+            }
             (Self::Message(l0), Self::Message(r0)) => l0 == r0,
-            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+            _ => discriminant(self) == discriminant(other),
         }
     }
 }

@@ -161,9 +161,9 @@ mod tests {
             loop {
                 match ctx.recv().await {
                     ActoInput::NoMoreSenders => break,
-                    ActoInput::Supervision(id, x) => {
+                    ActoInput::Supervision { id, result, .. } => {
                         let (arg, tx) = running.remove(&id).unwrap();
-                        let res = x.downcast::<Result<i32, i32>>().unwrap();
+                        let res = result.downcast::<Result<i32, i32>>().unwrap();
                         v.push(arg);
                         v.push(res.unwrap_or_else(|x| x));
                         tx.send(()).unwrap();
