@@ -13,8 +13,8 @@ pub use crate::tokio::AcTokio;
 mod actor;
 
 pub use actor::{
-    join, ActoCell, ActoHandle, ActoId, ActoInput, ActoRef, ActoRuntime, MailboxSize, Receiver,
-    Sender, SupervisionRef,
+    join, ActoCell, ActoHandle, ActoId, ActoInput, ActoRef, ActoRuntime, MailboxSize,
+    MappedActoHandle, Receiver, Sender, SupervisionRef,
 };
 
 #[cfg(test)]
