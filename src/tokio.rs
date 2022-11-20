@@ -121,7 +121,7 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
 #[cfg(test)]
 mod tests {
     use super::AcTokio;
-    use crate::{join, ActoId, ActoInput, ActoRuntime, SupervisionRef};
+    use crate::{join, ActoCell, ActoId, ActoInput, ActoRuntime, SupervisionRef};
     use std::{
         collections::BTreeMap,
         sync::{
@@ -137,12 +137,13 @@ mod tests {
         let sys = AcTokio::new("test", 1).unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let flag2 = flag.clone();
-        let SupervisionRef { me: r, handle: j } = sys.spawn_actor("super", |mut ctx| async move {
-            flag2.store(true, Ordering::Relaxed);
-            ctx.recv().await;
-            flag2.store(false, Ordering::Relaxed);
-            42
-        });
+        let SupervisionRef { me: r, handle: j } =
+            sys.spawn_actor("super", |mut ctx: ActoCell<_, _>| async move {
+                flag2.store(true, Ordering::Relaxed);
+                ctx.recv().await;
+                flag2.store(false, Ordering::Relaxed);
+                42
+            });
         std::thread::sleep(Duration::from_millis(100));
         assert!(flag.load(Ordering::Relaxed));
         r.send(());
@@ -155,35 +156,40 @@ mod tests {
     #[test]
     fn child() {
         let sys = AcTokio::new("test", 2).unwrap();
-        let SupervisionRef { me: r, handle: j } = sys.spawn_actor("super", |mut ctx| async move {
-            let mut v: Vec<i32> = vec![];
-            let mut running = BTreeMap::<ActoId, (i32, oneshot::Sender<()>)>::new();
-            loop {
-                match ctx.recv().await {
-                    ActoInput::NoMoreSenders => break,
-                    ActoInput::Supervision { id, result, .. } => {
-                        let (arg, tx) = running.remove(&id).unwrap();
-                        let res = result.downcast::<Result<i32, i32>>().unwrap();
-                        v.push(arg);
-                        v.push(res.unwrap_or_else(|x| x));
-                        tx.send(()).unwrap();
-                    }
-                    ActoInput::Message((x, tx)) => {
-                        v.push(x);
-                        let r = ctx.spawn_supervised("child", |mut ctx| async move {
-                            if let ActoInput::Message(x) = ctx.recv().await {
-                                Ok(2 * x)
-                            } else {
-                                Err(5)
-                            }
-                        });
-                        r.send(x);
-                        running.insert(r.id(), (x, tx));
+        let SupervisionRef { me: r, handle: j } = sys.spawn_actor(
+            "super",
+            |mut ctx: ActoCell<_, _, Result<i32, i32>>| async move {
+                let mut v: Vec<i32> = vec![];
+                let mut running = BTreeMap::<ActoId, (i32, oneshot::Sender<()>)>::new();
+                loop {
+                    match ctx.recv().await {
+                        ActoInput::NoMoreSenders => break,
+                        ActoInput::Supervision { id, result, .. } => {
+                            let (arg, tx) = running.remove(&id).unwrap();
+                            v.push(arg);
+                            v.push(result.unwrap().unwrap_or_else(|x| x));
+                            tx.send(()).unwrap();
+                        }
+                        ActoInput::Message((x, tx)) => {
+                            v.push(x);
+                            let r = ctx.spawn_supervised(
+                                "child",
+                                |mut ctx: ActoCell<_, _>| async move {
+                                    if let ActoInput::Message(x) = ctx.recv().await {
+                                        Ok(2 * x)
+                                    } else {
+                                        Err(5)
+                                    }
+                                },
+                            );
+                            r.send(x);
+                            running.insert(r.id(), (x, tx));
+                        }
                     }
                 }
-            }
-            v
-        });
+                v
+            },
+        );
         let (tx, rx) = oneshot::channel();
         r.send((1, tx));
         sys.rt().block_on(rx).unwrap();

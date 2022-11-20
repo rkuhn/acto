@@ -6,6 +6,7 @@ use std::{
     fmt::Debug,
     future::{poll_fn, Future},
     hash::Hash,
+    marker::PhantomData,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -219,15 +220,15 @@ type BoxErr = Box<dyn Any + Send + 'static>;
 ///
 /// Every actor is provided with an `ActoCell` when it is started, which is its
 /// means of interacting with other actors.
-pub struct ActoCell<M: Send + 'static, R: ActoRuntime> {
+pub struct ActoCell<M: Send + 'static, R: ActoRuntime, S: 'static = ()> {
     me: ActoRef<M>,
     runtime: R,
     recv: R::Receiver<M>,
-    supervised: Vec<Box<dyn ActoHandle<Output = ()>>>,
+    supervised: Vec<Box<dyn ActoHandle<Output = S>>>,
     no_senders_signaled: bool,
 }
 
-impl<M: Send + 'static, R: ActoRuntime> Drop for ActoCell<M, R> {
+impl<M: Send + 'static, R: ActoRuntime, S: 'static> Drop for ActoCell<M, R, S> {
     fn drop(&mut self) {
         for mut h in self.supervised.drain(..) {
             h.abort();
@@ -236,7 +237,7 @@ impl<M: Send + 'static, R: ActoRuntime> Drop for ActoCell<M, R> {
     }
 }
 
-impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
+impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
     /// Get access to the [`ActoRuntime`] driving this actor, e.g. to customise mailbox size for spawned actors.
     ///
     /// See [`MailboxSize`].
@@ -255,18 +256,17 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
     /// These may either be a message (sent via an [`ActoRef`]), the notification that all
     /// external `ActoRef`s have been dropped, or the termination notice of a supervised
     /// actor.
-    pub fn recv(&mut self) -> impl Future<Output = ActoInput<M>> + '_ {
+    pub fn recv(&mut self) -> impl Future<Output = ActoInput<M, S>> + '_ {
         poll_fn(|cx| {
             for idx in 0..self.supervised.len() {
                 let p = self.supervised[idx].poll(cx);
-                if let Poll::Ready(x) = p {
+                if let Poll::Ready(result) = p {
                     let handle = self.supervised.remove(idx);
                     tracing::trace!(src = ?handle.name(), "supervision");
                     return Poll::Ready(ActoInput::Supervision {
                         id: handle.id(),
                         name: handle.name().to_owned(),
-                        // ActoHandleBox wraps successes also into the Err case
-                        result: x.unwrap_err(),
+                        result,
                     });
                 }
             }
@@ -314,29 +314,30 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
     ///     a_ref.send(s_ref);
     /// }
     /// ```
-    pub fn spawn<T: Send + 'static, F, Fut>(
+    pub fn spawn<M2: Send + 'static, F, Fut, S2>(
         &self,
         name: &str,
         actor: F,
-    ) -> SupervisionRef<T, R::ActoHandle<Fut::Output>>
+    ) -> SupervisionRef<M2, R::ActoHandle<Fut::Output>>
     where
-        F: FnOnce(ActoCell<T, R>) -> Fut,
+        F: FnOnce(ActoCell<M2, R, S2>) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
+        S2: Send + 'static,
     {
         self.runtime.spawn_actor(name, actor)
     }
 
     /// Create a new actor on the same [`ActoRuntime`] as the current one and [`ActoCell::supervise`] it.
-    pub fn spawn_supervised<T: Send + 'static, F, Fut>(
+    pub fn spawn_supervised<M2: Send + 'static, F, Fut, S2>(
         &mut self,
         name: &str,
         actor: F,
-    ) -> ActoRef<T>
+    ) -> ActoRef<M2>
     where
-        F: FnOnce(ActoCell<T, R>) -> Fut,
-        Fut: Future + Send + 'static,
-        Fut::Output: Send + 'static,
+        F: FnOnce(ActoCell<M2, R, S2>) -> Fut,
+        Fut: Future<Output = S> + Send + 'static,
+        S2: Send + 'static,
     {
         self.supervise(self.spawn(name, actor))
     }
@@ -348,11 +349,10 @@ impl<M: Send + 'static, R: ActoRuntime> ActoCell<M, R> {
     pub fn supervise<T, H>(&mut self, actor: SupervisionRef<T, H>) -> ActoRef<T>
     where
         T: Send + 'static,
-        H: ActoHandle + Send + 'static,
-        H::Output: Send + 'static,
+        H: ActoHandle<Output = S> + Send + 'static,
     {
         tracing::trace!(target = ?actor.me.name(), "supervise");
-        self.supervised.push(Box::new(ActoHandleBox(actor.handle)));
+        self.supervised.push(Box::new(actor.handle));
         actor.me
     }
 }
@@ -387,7 +387,7 @@ impl<M: Send + 'static, H> SupervisionRef<M, H> {
     ///             // if any of them fail, shut all of them down
     ///         }
     ///     );
-    ///     let actor = cell.spawn("actor", |mut cell| async move {
+    ///     let actor = cell.spawn("actor", |mut cell: ActoCell<_, _>| async move {
     ///         while let ActoInput::Message(msg) = cell.recv().await {
     ///             if let ActorCommand::Shutdown(_) = msg {
     ///                 break;
@@ -421,7 +421,7 @@ impl<M: Send + 'static, H> SupervisionRef<M, H> {
 
 /// Actor input as received with [`ActoCell::recv`].
 #[derive(Debug)]
-pub enum ActoInput<M> {
+pub enum ActoInput<M, S> {
     /// All previously generated [`ActoRef`] handles were dropped, leaving only
     /// the one within [`ActoCell`]; the actor may wish to terminate unless it has
     /// other sources of input.
@@ -443,13 +443,13 @@ pub enum ActoInput<M> {
     Supervision {
         id: ActoId,
         name: String,
-        result: BoxErr,
+        result: Result<S, BoxErr>,
     },
     /// A message has been received via our [`ActoRef`] handle.
     Message(M),
 }
 
-impl<M> ActoInput<M> {
+impl<M, S> ActoInput<M, S> {
     pub fn is_sender_gone(&self) -> bool {
         matches!(self, ActoInput::NoMoreSenders)
     }
@@ -468,22 +468,24 @@ impl<M> ActoInput<M> {
     /// use acto::{ActoCell, ActoRuntime};
     ///
     /// async fn actor(mut cell: ActoCell<String, impl ActoRuntime>) {
-    ///     while let Some(input) = cell.recv().await.into_value() {
+    ///     while let Some(input) = cell.recv().await.has_senders() {
     ///         // do something with it
     ///     }
     ///     // actor automatically stops when all senders are gone
     /// }
     /// ```
-    pub fn into_value(self) -> Option<Result<M, (ActoId, String, BoxErr)>> {
+    pub fn has_senders(self) -> Option<ActoMsgSuper<M, S>> {
         match self {
             ActoInput::NoMoreSenders => None,
-            ActoInput::Supervision { id, name, result } => Some(Err((id, name, result))),
-            ActoInput::Message(msg) => Some(Ok(msg)),
+            ActoInput::Supervision { id, name, result } => {
+                Some(ActoMsgSuper::Supervision { id, name, result })
+            }
+            ActoInput::Message(msg) => Some(ActoMsgSuper::Message(msg)),
         }
     }
 }
 
-impl<M: PartialEq> PartialEq for ActoInput<M> {
+impl<M: PartialEq, S> PartialEq for ActoInput<M, S> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Supervision { id: left, .. }, Self::Supervision { id: right, .. }) => {
@@ -493,6 +495,19 @@ impl<M: PartialEq> PartialEq for ActoInput<M> {
             _ => discriminant(self) == discriminant(other),
         }
     }
+}
+
+/// A filtered variant of [`ActoInput`] that omits `NoMoreSenders`.
+///
+/// see [`ActoInput::has_senders`]
+pub enum ActoMsgSuper<M, S> {
+    Supervision {
+        id: ActoId,
+        name: String,
+        result: Result<S, BoxErr>,
+    },
+    /// A message has been received via our [`ActoRef`] handle.
+    Message(M),
 }
 
 /// For implementors: the interface of a runtime for operating actors.
@@ -522,16 +537,17 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
     /// Provided function for spawning actors.
     ///
     /// Uses the above utilities and cannot be implemented by downstream crates.
-    fn spawn_actor<T, F, Fut>(
+    fn spawn_actor<M, F, Fut, S>(
         &self,
         name: &str,
         actor: F,
-    ) -> SupervisionRef<T, Self::ActoHandle<Fut::Output>>
+    ) -> SupervisionRef<M, Self::ActoHandle<Fut::Output>>
     where
-        T: Send + 'static,
-        F: FnOnce(ActoCell<T, Self>) -> Fut,
+        M: Send + 'static,
+        F: FnOnce(ActoCell<M, Self, S>) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
+        S: Send + 'static,
     {
         let (sender, recv) = self.mailbox();
         let id = ActoId::next();
@@ -625,7 +641,10 @@ fn test_write_id() {
 /// ```rust
 /// # use acto::{ActoCell, ActoRef, ActoRuntime, MailboxSize};
 /// async fn actor(cell: ActoCell<String, impl MailboxSize>) {
-///     let child: ActoRef<u8> = cell.rt().with_mailbox_size(10).spawn_actor("child", |_| async {}).me;
+///     let child: ActoRef<u8> = cell.rt()
+///         .with_mailbox_size(10)
+///         .spawn_actor("child", |_: ActoCell<_, _>| async {})
+///         .me;
 /// }
 /// ```
 pub trait MailboxSize: ActoRuntime {
@@ -686,6 +705,14 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
     ///
     /// This method has [`Future`] semantics.
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Output, BoxErr>>;
+
+    /// Transform the output value of this handle, e.g. before calling [`ActoCell::supervise`].
+    fn map<O, F>(self, transform: F) -> MappedActoHandle<Self, F, O>
+    where
+        Self: Sized,
+    {
+        MappedActoHandle::new(self, transform)
+    }
 }
 
 /// A future for awaiting the termination of the actor underlying the given handle.
@@ -703,33 +730,51 @@ impl<J: ActoHandle> Future for ActoHandleFuture<J> {
     }
 }
 
-struct ActoHandleBox<J: ActoHandle>(J);
-impl<J> ActoHandle for ActoHandleBox<J>
+/// An [`ActoHandle`] that results from [`ActoHandle::map`].
+pub struct MappedActoHandle<H, F, O> {
+    inner: H,
+    transform: Option<F>,
+    _ph: PhantomData<O>,
+}
+
+impl<H, F, O> MappedActoHandle<H, F, O> {
+    fn new(inner: H, transform: F) -> Self {
+        Self {
+            inner,
+            transform: Some(transform),
+            _ph: PhantomData,
+        }
+    }
+}
+
+impl<H, F, O> ActoHandle for MappedActoHandle<H, F, O>
 where
-    J: ActoHandle,
-    J::Output: Send + 'static,
+    H: ActoHandle,
+    F: FnOnce(H::Output) -> O + Send + Sync + Unpin + 'static,
+    O: Send + Sync + Unpin + 'static,
 {
-    type Output = ();
+    type Output = O;
 
     fn id(&self) -> ActoId {
-        self.0.id()
+        self.inner.id()
     }
 
     fn name(&self) -> &str {
-        self.0.name()
+        self.inner.name()
     }
 
     fn abort(&mut self) {
-        self.0.abort()
+        self.inner.abort()
     }
 
     fn is_finished(&mut self) -> bool {
-        self.0.is_finished()
+        self.inner.is_finished()
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxErr>> {
-        self.0
-            .poll(cx)
-            .map(|r| r.and_then(|x| Err(Box::new(x) as BoxErr)))
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, BoxErr>> {
+        self.inner.poll(cx).map(|r| {
+            let transform = self.transform.take().expect("polled after finish");
+            r.map(transform)
+        })
     }
 }

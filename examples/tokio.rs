@@ -3,12 +3,12 @@ use acto::{join, AcTokio, ActoCell, ActoInput, ActoRuntime, SupervisionRef};
 async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     println!("main actor started");
     while let ActoInput::Message(m) = ctx.recv().await {
-        ctx.spawn_supervised("subordinate", |mut ctx| async move {
+        ctx.spawn_supervised("subordinate", |mut ctx: ActoCell<_, _>| async move {
             println!("spawned actor for {:?}", ctx.recv().await);
         })
         .send(m);
 
-        let r = ctx.spawn("worker", |mut ctx| async move {
+        let r = ctx.spawn("worker", |mut ctx: ActoCell<_, _>| async move {
             match ctx.recv().await {
                 ActoInput::NoMoreSenders => "no send".to_owned(),
                 ActoInput::Supervision { .. } => unreachable!(),
