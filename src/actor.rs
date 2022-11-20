@@ -365,7 +365,7 @@ pub struct SupervisionRef<M, H> {
     pub handle: H,
 }
 
-impl<M: Send + 'static, H> SupervisionRef<M, H> {
+impl<M: Send + 'static, H: ActoHandle> SupervisionRef<M, H> {
     /// Derive a new reference by embedding the supervisor-required type `M2` into the message schema.
     ///
     /// ```rust
@@ -417,6 +417,38 @@ impl<M: Send + 'static, H> SupervisionRef<M, H> {
         let me = ActoRef(Arc::new(inner));
         SupervisionRef { me, handle }
     }
+
+    /// Map the return type of the contained [`ActoHandle`] to match the intended supervisor.
+    ///
+    /// ```rust
+    /// # use acto::{ActoCell, ActoInput, ActoRef, ActoRuntime, SupervisionRef, AcTokio, join};
+    /// async fn top_level(mut cell: ActoCell<(), impl ActoRuntime, String>) -> ActoInput<(), String> {
+    ///     let actor = cell.spawn("actor", |mut cell: ActoCell<(), _>| async move {
+    ///         // some async computation that leads to the result
+    ///         42
+    ///     });
+    ///     // cannot supervise without transforming result to a String
+    ///     let ar = cell.supervise(actor.map_handle(|number| number.to_string()));
+    ///     // now do something with the actor reference
+    /// #   cell.recv().await
+    /// }
+    /// # let sys = AcTokio::new("doc", 1).unwrap();
+    /// # let ah = sys.spawn_actor("top", top_level);
+    /// # let ah = ah.handle;
+    /// # let ActoInput::Supervision { name, result, ..} = sys.rt().block_on(join(ah)).unwrap() else { panic!("wat") };
+    /// # assert!(name.starts_with("actor(doc/"));
+    /// # assert_eq!(result.unwrap(), "42");
+    /// ```
+    pub fn map_handle<S, F>(self, f: F) -> SupervisionRef<M, MappedActoHandle<H, F, S>>
+    where
+        F: FnOnce(H::Output) -> S + Send + Sync + Unpin + 'static,
+        S: Send + 'static,
+    {
+        SupervisionRef {
+            me: self.me,
+            handle: MappedActoHandle::new(self.handle, f),
+        }
+    }
 }
 
 /// Actor input as received with [`ActoCell::recv`].
@@ -431,9 +463,8 @@ pub enum ActoInput<M, S> {
     NoMoreSenders,
     /// A supervised actor with the given [`ActoId`] has terminated.
     ///
-    /// Use downcasting to acquire the output value emitted by the actor’s Future.
-    /// Depending on the runtime, the box may instead contain the value with which
-    /// the actor panicked.
+    /// The result contains either the value returned by the actor or the value
+    /// with which the actor’s task panicked (if the underlying runtime handles this).
     ///
     /// ## Important notice
     ///
