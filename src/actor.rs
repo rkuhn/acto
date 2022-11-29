@@ -44,6 +44,7 @@ struct ActoRefInner<S: ?Sized> {
 enum Inner {
     Straight(Straight),
     Mapped(Mapped),
+    Blackhole,
 }
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
@@ -103,6 +104,15 @@ impl<T> Hash for ActoRef<T> {
 }
 
 impl<M> ActoRef<M> {
+    /// Create a dummy reference that drops all messages
+    pub fn blackhole() -> Self {
+        Self(Arc::new(ActoRefInner {
+            fields: Inner::Blackhole,
+            id: ActoId::next(),
+            sender: |_| true,
+        }))
+    }
+
     /// The [`ActoId`] of the referenced actor.
     pub fn id(&self) -> ActoId {
         self.0.id
@@ -113,27 +123,43 @@ impl<M> ActoRef<M> {
         match &self.0.fields {
             Inner::Straight(s) => s.name.as_str(),
             Inner::Mapped(m) => unsafe { &*m.name },
+            Inner::Blackhole => "blackhole(acto/0)",
         }
     }
 
-    fn count(&self) -> &AtomicUsize {
+    #[inline(always)]
+    fn with_count(&self, f: impl FnOnce(&AtomicUsize) -> usize) -> usize {
         match &self.0.fields {
-            Inner::Straight(s) => &s.count,
-            Inner::Mapped(m) => unsafe { &*m.count },
+            Inner::Straight(s) => f(&s.count),
+            Inner::Mapped(m) => f(unsafe { &*m.count }),
+            Inner::Blackhole => 0,
         }
     }
 
-    fn dead(&self) -> &AtomicBool {
+    fn dead(&self) {
         match &self.0.fields {
-            Inner::Straight(s) => &s.dead,
-            Inner::Mapped(m) => unsafe { &*m.dead },
+            Inner::Straight(s) => s.dead.store(true, Ordering::Release),
+            Inner::Mapped(m) => unsafe { &*m.dead }.store(true, Ordering::Release),
+            Inner::Blackhole => {}
         }
     }
 
-    fn waker(&self) -> &Mutex<Option<Waker>> {
+    fn waker(&self, waker: Waker) {
         match &self.0.fields {
-            Inner::Straight(s) => &s.waker,
-            Inner::Mapped(m) => unsafe { &*m.waker },
+            Inner::Straight(s) => *s.waker.lock() = Some(waker),
+            Inner::Mapped(m) => *unsafe { &*m.waker }.lock() = Some(waker),
+            Inner::Blackhole => {}
+        }
+    }
+
+    fn wake(&self) {
+        let waker = match &self.0.fields {
+            Inner::Straight(s) => s.waker.lock().take(),
+            Inner::Mapped(m) => unsafe { &*m.waker }.lock().take(),
+            Inner::Blackhole => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 
@@ -142,8 +168,14 @@ impl<M> ActoRef<M> {
     /// Note that this is not the same as [`ActoHandle::is_finished`], which checks whether
     /// the actor’s task is done. An actor could drop its [`ActoCell`] (yielding `true` here)
     /// or it could move it to another async task (yielding `true` from `ActoHandle`).
+    ///
+    /// Note that a “blackhole” reference is immortal.
     pub fn is_gone(&self) -> bool {
-        self.dead().load(Ordering::Acquire)
+        match &self.0.fields {
+            Inner::Straight(s) => s.dead.load(Ordering::Acquire),
+            Inner::Mapped(m) => unsafe { &*m.dead }.load(Ordering::Acquire),
+            Inner::Blackhole => false,
+        }
     }
 }
 
@@ -179,6 +211,7 @@ impl<M: Send + 'static> ActoRef<M> {
         let fields = match &self.0.fields {
             Inner::Straight(s) => Inner::Mapped(s.into()),
             Inner::Mapped(x) => Inner::Mapped(*x),
+            Inner::Blackhole => Inner::Blackhole,
         };
         let orig = self.0.clone();
         let inner = ActoRefInner {
@@ -188,22 +221,23 @@ impl<M: Send + 'static> ActoRef<M> {
         };
         ActoRef(Arc::new(inner))
     }
+
+    pub fn is_blackhole(&self) -> bool {
+        matches!(self.0.fields, Inner::Blackhole)
+    }
 }
 
 impl<M> Clone for ActoRef<M> {
     fn clone(&self) -> Self {
-        self.count().fetch_add(1, Ordering::Relaxed);
+        self.with_count(|c| c.fetch_add(1, Ordering::SeqCst));
         Self(self.0.clone())
     }
 }
 
 impl<M> Drop for ActoRef<M> {
     fn drop(&mut self) {
-        if self.count().fetch_sub(1, Ordering::Relaxed) == 1 {
-            let waker = self.waker().lock().take();
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+        if self.with_count(|c| c.fetch_sub(1, Ordering::SeqCst)) == 1 {
+            self.wake()
         }
     }
 }
@@ -233,7 +267,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: 'static> Drop for ActoCell<M, R, S> {
         for mut h in self.supervised.drain(..) {
             h.abort();
         }
-        self.me.dead().store(true, Ordering::Release);
+        self.me.dead();
     }
 }
 
@@ -274,7 +308,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
                 tracing::trace!("got message");
                 return Poll::Ready(ActoInput::Message(msg));
             }
-            if self.me.count().load(Ordering::Relaxed) == 0 {
+            if self.me.with_count(|c| c.load(Ordering::SeqCst)) == 0 {
                 tracing::trace!("no more senders");
                 if !self.no_senders_signaled {
                     self.no_senders_signaled = true;
@@ -282,9 +316,9 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
                 }
             } else if !self.no_senders_signaled {
                 // only install waker if we’re interested in emitting NoMoreSenders
-                *self.me.waker().lock() = Some(cx.waker().clone());
+                self.me.waker(cx.waker().clone());
                 // re-check in case last ref was dropped between check and lock
-                if self.me.count().load(Ordering::Relaxed) == 0 {
+                if self.me.with_count(|c| c.load(Ordering::SeqCst)) == 0 {
                     tracing::trace!(me = ?self.me.name(), "no sender");
                     self.no_senders_signaled = true;
                     return Poll::Ready(ActoInput::NoMoreSenders);
@@ -407,6 +441,7 @@ impl<M: Send + 'static, H: ActoHandle> SupervisionRef<M, H> {
         let fields = match &me.0.fields {
             Inner::Straight(s) => Inner::Mapped(s.into()),
             Inner::Mapped(x) => Inner::Mapped(*x),
+            Inner::Blackhole => Inner::Blackhole,
         };
         let id = me.id();
         let inner = ActoRefInner {
