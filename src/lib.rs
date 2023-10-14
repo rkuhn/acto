@@ -11,6 +11,7 @@ mod tokio;
 pub use crate::tokio::AcTokio;
 
 mod actor;
+pub mod variable;
 
 pub use actor::{
     join, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime, MailboxSize,
