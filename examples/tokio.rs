@@ -1,4 +1,4 @@
-use acto::{join, AcTokio, ActoCell, ActoInput, ActoRuntime, SupervisionRef};
+use acto::{join, ActoCell, ActoInput, ActoRuntime, SupervisionRef};
 
 async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     println!("main actor started");
@@ -24,11 +24,17 @@ async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     }
 }
 
+#[cfg(feature = "tokio")]
 fn main() {
-    let system = AcTokio::new("theMain", 2).unwrap();
+    let system = acto::AcTokio::new("theMain", 2).unwrap();
     let SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
     r.send(1);
     r.send(2);
     let x = system.rt().block_on(join(j));
     println!("result: {:?}", x);
+}
+
+#[cfg(not(feature = "tokio"))]
+fn main() {
+    println!("This example requires the 'tokio' feature");
 }

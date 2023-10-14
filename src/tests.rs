@@ -1,3 +1,5 @@
+#![cfg(feature = "tokio")]
+
 use crate::{join, tokio::AcTokio, ActoCell, ActoHandle, ActoInput, ActoRuntime, SupervisionRef};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
