@@ -1,11 +1,15 @@
-use crate::{ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender};
+use crate::{actor::ActoAborted, ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender};
+use parking_lot::Mutex;
 use smol_str::SmolStr;
 use std::{
     any::Any,
-    future::Future,
+    future::{poll_fn, Future},
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Waker},
 };
 use tokio::{
     runtime::{Builder, Runtime},
@@ -28,7 +32,12 @@ impl AcTokio {
             .enable_all()
             .build()?;
         Ok(Self {
-            inner: Arc::new(Inner { name, rt }),
+            inner: Arc::new(Inner {
+                name,
+                rt,
+                dropping: AtomicUsize::default(),
+                waiting: Mutex::new(Vec::new()),
+            }),
             mailbox_size: 128,
         })
     }
@@ -36,11 +45,27 @@ impl AcTokio {
     pub fn rt(&self) -> &Runtime {
         &self.inner.rt
     }
+
+    /// Wait for all aborted actors to be dropped
+    pub fn drop_done(&self) -> DropDone {
+        DropDone(self.inner.clone())
+    }
 }
 
 struct Inner {
     name: String,
     rt: Runtime,
+    dropping: AtomicUsize,
+    waiting: Mutex<Vec<Waker>>,
+}
+
+impl Inner {
+    fn notify_drop(&self) {
+        let mut waiting = self.waiting.lock();
+        for waker in waiting.drain(..) {
+            waker.wake();
+        }
+    }
 }
 
 impl ActoRuntime for AcTokio {
@@ -62,7 +87,27 @@ impl ActoRuntime for AcTokio {
         T: std::future::Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        TokioJoinHandle(id, name, self.inner.rt.spawn(task))
+        TokioJoinHandle(
+            id,
+            name,
+            Some(self.inner.rt.spawn(task)),
+            self.inner.clone(),
+        )
+    }
+}
+
+pub struct DropDone(Arc<Inner>);
+
+impl Future for DropDone {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.dropping.load(Ordering::Relaxed) == 0 {
+            Poll::Ready(())
+        } else {
+            self.0.waiting.lock().push(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -91,7 +136,19 @@ impl<M: Send + 'static> Receiver<M> for TokioReceiver<M> {
     }
 }
 
-pub struct TokioJoinHandle<O>(ActoId, SmolStr, tokio::task::JoinHandle<O>);
+pub struct TokioJoinHandle<O>(
+    ActoId,
+    SmolStr,
+    Option<tokio::task::JoinHandle<O>>,
+    Arc<Inner>,
+);
+
+impl<O: Send + 'static> TokioJoinHandle<O> {
+    pub fn join(mut self) -> impl Future<Output = Result<O, Box<dyn Any + Send + 'static>>> {
+        poll_fn(move |cx| self.poll(cx))
+    }
+}
+
 impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     type Output = O;
 
@@ -104,17 +161,33 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     }
 
     fn abort(&mut self) {
-        self.2.abort();
+        let inner = self.3.clone();
+        inner.dropping.fetch_add(1, Ordering::Relaxed);
+        let handle = self.2.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            self.3.rt.spawn(async move {
+                handle.await.ok();
+                let d = inner.dropping.fetch_sub(1, Ordering::Relaxed);
+                if d == 1 {
+                    inner.notify_drop();
+                }
+            });
+        }
     }
 
     fn is_finished(&mut self) -> bool {
-        self.2.is_finished()
+        self.2.as_ref().map(|h| h.is_finished()).unwrap_or(true)
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
-        Pin::new(&mut self.2)
-            .poll(cx)
-            .map(|r| r.map_err(|err| Box::new(err) as Box<dyn Any + Send + 'static>))
+        if let Some(ref mut handle) = self.2 {
+            Pin::new(handle)
+                .poll(cx)
+                .map(|r| r.map_err(|err| Box::new(err) as Box<dyn Any + Send + 'static>))
+        } else {
+            Poll::Ready(Err(Box::new(ActoAborted::new(self.1.as_str()))))
+        }
     }
 }
 

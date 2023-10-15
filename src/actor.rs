@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use smol_str::SmolStr;
 use std::{
     any::Any,
-    fmt::Debug,
+    fmt::{self, Debug},
     future::{poll_fn, Future},
     hash::Hash,
     marker::PhantomData,
@@ -249,6 +249,24 @@ impl<M> Debug for ActoRef<M> {
 }
 
 type BoxErr = Box<dyn Any + Send + 'static>;
+
+/// This error is returned when an actor has been aborted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActoAborted(SmolStr);
+
+impl ActoAborted {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::error::Error for ActoAborted {}
+
+impl fmt::Display for ActoAborted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Actor aborted: {}", self.0)
+    }
+}
 
 /// The confines of an actor, and the engine that makes it work.
 ///
