@@ -14,8 +14,8 @@ mod actor;
 pub mod variable;
 
 pub use actor::{
-    join, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime, MailboxSize,
-    MappedActoHandle, Receiver, Sender, SupervisionRef,
+    join, ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
+    MailboxSize, MappedActoHandle, Receiver, Sender, SupervisionRef,
 };
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "acto"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Roland Kuhn <rk@rkuhn.info>"]
 edition = "2021"
 description = "light-weight Actor library for Rust"
