@@ -1,31 +1,87 @@
 use crate::{actor::ActoAborted, ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::{
     any::Any,
     future::{poll_fn, Future},
+    ops::Deref,
     pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    task::{Context, Poll, Waker},
+    sync::Arc,
+    task::{Context, Poll},
 };
 use tokio::{
     runtime::{Builder, Runtime},
     sync::mpsc,
 };
 
+/// Owned handle to an [`AcTokioRuntime`].
+///
+/// Dropping this handle will abort all actors spawned by this runtime.
+pub struct AcTokio(AcTokioRuntime);
+
+impl AcTokio {
+    /// Create a new [`AcTokio`] runtime with the given name and number of threads.
+    ///
+    /// The following demonstrates that this object owns the tokio runtime:
+    ///
+    /// ```
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    /// use acto::{AcTokio, ActoRuntime, ActoCell};
+    ///
+    /// let flag = Arc::new(AtomicBool::new(false));
+    /// let flag2 = flag.clone();
+    /// let (tx, rx) = tokio::sync::oneshot::channel();
+    ///
+    /// let tokio = AcTokio::new("test", 1).unwrap();
+    /// tokio.spawn_actor("test", move |mut ctx: ActoCell<(), _>| async move {
+    ///     struct X(Arc<AtomicBool>);
+    ///     impl Drop for X {
+    ///         fn drop(&mut self) {
+    ///             self.0.store(true, Ordering::Relaxed);
+    ///         }
+    ///     }
+    ///     let _x = X(flag2);
+    ///     tx.send(()).unwrap();
+    ///     loop { ctx.recv().await; }
+    /// });
+    ///
+    /// tokio.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
+    /// drop(tokio);
+    ///
+    /// assert!(flag.load(Ordering::Relaxed));
+    /// ```
+    pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
+        Ok(Self(AcTokioRuntime::new(name, num_threads)?))
+    }
+}
+
+impl Deref for AcTokio {
+    type Target = AcTokioRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for AcTokio {
+    fn drop(&mut self) {
+        self.0.inner.rt.write().take();
+    }
+}
+
 /// An [`ActoRuntime`] based on [`tokio::runtime`] and [`tokio::sync::mpsc`] queues.
+///
+/// In order to create it, see [`AcTokio::new()`].
 #[derive(Clone)]
-pub struct AcTokio {
+pub struct AcTokioRuntime {
     inner: Arc<Inner>,
     mailbox_size: usize,
 }
 
-impl AcTokio {
-    pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
+impl AcTokioRuntime {
+    fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
         let name = name.into();
+        tracing::debug!(%name, ?num_threads, "creating");
         let rt = Builder::new_multi_thread()
             .thread_name(&name)
             .worker_threads(num_threads)
@@ -34,41 +90,27 @@ impl AcTokio {
         Ok(Self {
             inner: Arc::new(Inner {
                 name,
-                rt,
-                dropping: AtomicUsize::default(),
-                waiting: Mutex::new(Vec::new()),
+                rt: RwLock::new(Some(rt)),
             }),
             mailbox_size: 128,
         })
     }
 
-    pub fn rt(&self) -> &Runtime {
-        &self.inner.rt
-    }
-
-    /// Wait for all aborted actors to be dropped
-    pub fn drop_done(&self) -> DropDone {
-        DropDone(self.inner.clone())
+    /// Perform a task using the underlying runtime.
+    ///
+    /// Beware that while this function is running, dropping the [`AcTokio`] handle will block until the task is finished.
+    pub fn with_rt<U>(&self, f: impl FnOnce(&Runtime) -> U) -> Option<U> {
+        let _span = tracing::debug_span!("with_rt").entered();
+        self.inner.rt.read().as_ref().map(f)
     }
 }
 
 struct Inner {
     name: String,
-    rt: Runtime,
-    dropping: AtomicUsize,
-    waiting: Mutex<Vec<Waker>>,
+    rt: RwLock<Option<Runtime>>,
 }
 
-impl Inner {
-    fn notify_drop(&self) {
-        let mut waiting = self.waiting.lock();
-        for waker in waiting.drain(..) {
-            waker.wake();
-        }
-    }
-}
-
-impl ActoRuntime for AcTokio {
+impl ActoRuntime for AcTokioRuntime {
     type ActoHandle<O: Send + 'static> = TokioJoinHandle<O>;
     type Sender<M: Send + 'static> = TokioSender<M>;
     type Receiver<M: Send + 'static> = TokioReceiver<M>;
@@ -87,31 +129,17 @@ impl ActoRuntime for AcTokio {
         T: std::future::Future + Send + 'static,
         T::Output: Send + 'static,
     {
+        let _span = tracing::debug_span!("spawn_task").entered();
         TokioJoinHandle(
             id,
             name,
-            Some(self.inner.rt.spawn(task)),
+            self.inner.rt.read().as_ref().map(|rt| rt.spawn(task)),
             self.inner.clone(),
         )
     }
 }
 
-pub struct DropDone(Arc<Inner>);
-
-impl Future for DropDone {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0.dropping.load(Ordering::Relaxed) == 0 {
-            Poll::Ready(())
-        } else {
-            self.0.waiting.lock().push(cx.waker().clone());
-            Poll::Pending
-        }
-    }
-}
-
-impl MailboxSize for AcTokio {
+impl MailboxSize for AcTokioRuntime {
     type Output = Self;
 
     fn with_mailbox_size(&self, mailbox_size: usize) -> Self::Output {
@@ -161,18 +189,10 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     }
 
     fn abort(&mut self) {
-        let inner = self.3.clone();
-        inner.dropping.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(name = ?self.0, handle = ?self.2.is_some(), "aborting");
         let handle = self.2.take();
         if let Some(handle) = handle {
             handle.abort();
-            self.3.rt.spawn(async move {
-                handle.await.ok();
-                let d = inner.dropping.fetch_sub(1, Ordering::Relaxed);
-                if d == 1 {
-                    inner.notify_drop();
-                }
-            });
         }
     }
 
@@ -222,7 +242,7 @@ mod tests {
         r.send(());
         std::thread::sleep(Duration::from_millis(100));
         assert!(!flag.load(Ordering::Relaxed));
-        let ret = sys.rt().block_on(join(j));
+        let ret = sys.with_rt(|rt| rt.block_on(join(j))).unwrap();
         assert_eq!(ret.unwrap(), 42);
     }
 
@@ -265,12 +285,12 @@ mod tests {
         );
         let (tx, rx) = oneshot::channel();
         r.send((1, tx));
-        sys.rt().block_on(rx).unwrap();
+        sys.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
         let (tx, rx) = oneshot::channel();
         r.send((2, tx));
-        sys.rt().block_on(rx).unwrap();
+        sys.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
         drop(r);
-        let v = sys.rt().block_on(join(j)).unwrap();
+        let v = sys.with_rt(|rt| rt.block_on(join(j))).unwrap().unwrap();
         assert_eq!(v, vec![1, 1, 2, 2, 2, 4]);
     }
 }

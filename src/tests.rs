@@ -2,7 +2,7 @@
 
 use crate::{join, tokio::AcTokio, ActoCell, ActoHandle, ActoInput, ActoRuntime, SupervisionRef};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::timeout};
 use tracing_subscriber::EnvFilter;
 
 macro_rules! assert_timed {
@@ -19,7 +19,10 @@ macro_rules! assert_timed {
 fn supervisor_termination() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        // .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::ENTER
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
         .init();
     let sys = AcTokio::new("test", 2).unwrap();
 
@@ -40,16 +43,24 @@ fn supervisor_termination() {
                 cell.recv().await;
                 probe3
             });
+            println!("x");
             tx.send(()).ok();
             cell.recv().await
         });
     assert_eq!(&r.name()[..11], "super(test/");
 
-    sys.rt().block_on(rx).unwrap();
+    sys.with_rt(|rt| rt.block_on(async { timeout(Duration::from_secs(1), rx).await }))
+        .expect("runtime should be there")
+        .expect("timed out")
+        .expect("channel gone");
     assert_eq!(Arc::strong_count(&probe), 4);
 
     r.send(());
-    let msg = sys.rt().block_on(join(j)).unwrap();
+    let msg = sys
+        .with_rt(|rt| rt.block_on(async { timeout(Duration::from_secs(1), join(j)).await }))
+        .expect("runtime should be there")
+        .expect("timed out")
+        .expect("panicked");
     assert_eq!(msg, ActoInput::Message(()));
     assert_timed!(
         Arc::strong_count(&probe) == 1,

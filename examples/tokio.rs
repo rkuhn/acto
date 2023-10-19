@@ -30,7 +30,7 @@ fn main() {
     let SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
     r.send(1);
     r.send(2);
-    let x = system.rt().block_on(join(j));
+    let x = system.with_rt(|rt| rt.block_on(join(j)));
     println!("result: {:?}", x);
 }
 

@@ -8,7 +8,7 @@
 mod tokio;
 
 #[cfg(feature = "tokio")]
-pub use crate::tokio::AcTokio;
+pub use crate::tokio::{AcTokio, AcTokioRuntime};
 
 mod actor;
 pub mod variable;

@@ -204,7 +204,7 @@ impl<M: Send + 'static> ActoRef<M> {
     /// let ar = rt.spawn_actor("a", actor).me.contramap(|msg| Some(msg));
     /// let (tx, rx) = oneshot::channel();
     /// ar.send(tx);
-    /// # let response = rt.rt().block_on(rx).unwrap();
+    /// # let response = rt.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
     /// # assert_eq!(response, 42);
     /// ```
     pub fn contramap<M2>(&self, f: impl Fn(M2) -> M + Send + Sync + 'static) -> ActoRef<M2> {
@@ -488,7 +488,7 @@ impl<M: Send + 'static, H: ActoHandle> SupervisionRef<M, H> {
     /// # let sys = AcTokio::new("doc", 1).unwrap();
     /// # let ah = sys.spawn_actor("top", top_level);
     /// # let ah = ah.handle;
-    /// # let ActoInput::Supervision { name, result, ..} = sys.rt().block_on(join(ah)).unwrap() else { panic!("wat") };
+    /// # let ActoInput::Supervision { name, result, ..} = sys.with_rt(|rt| rt.block_on(join(ah))).unwrap().unwrap() else { panic!("wat") };
     /// # assert!(name.starts_with("actor(doc/"));
     /// # assert_eq!(result.unwrap(), "42");
     /// ```
