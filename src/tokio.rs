@@ -22,6 +22,22 @@ pub struct AcTokio(AcTokioRuntime);
 impl AcTokio {
     /// Create a new [`AcTokio`] runtime with the given name and number of threads.
     ///
+    /// ```
+    /// # use acto::{AcTokio, ActoInput, ActoRuntime};
+    /// let rt = AcTokio::new("test", 1).unwrap();
+    ///
+    /// let actor = rt.spawn_actor("test", |mut ctx| async move {
+    ///     let ActoInput::<String, ()>::Message(name) = ctx.recv().await else { return };
+    ///     println!("Hello, {}!", name);
+    /// });
+    ///
+    /// // Send a message to the actor, after which it will terminate.
+    /// actor.me.send("world".to_owned());
+    /// // Wait for the actor to terminate.
+    /// rt.with_rt(|rt| rt.block_on(acto::join(actor.handle))).unwrap();
+    /// ```
+    ///
+    /// In the above example the last step is crucial, without it nothing may be printed.
     /// The following demonstrates that this object owns the tokio runtime:
     ///
     /// ```
@@ -29,25 +45,28 @@ impl AcTokio {
     /// use acto::{AcTokio, ActoRuntime, ActoCell};
     ///
     /// let flag = Arc::new(AtomicBool::new(false));
-    /// let flag2 = flag.clone();
-    /// let (tx, rx) = tokio::sync::oneshot::channel();
+    ///
+    /// // This serves as a drop detector so we know the actor was killed.
+    /// struct X(Arc<AtomicBool>);
+    /// impl Drop for X {
+    ///     fn drop(&mut self) {
+    ///         self.0.store(true, Ordering::Relaxed);
+    ///     }
+    /// }
+    /// let x = X(flag.clone());
     ///
     /// let tokio = AcTokio::new("test", 1).unwrap();
     /// tokio.spawn_actor("test", move |mut ctx: ActoCell<(), _>| async move {
-    ///     struct X(Arc<AtomicBool>);
-    ///     impl Drop for X {
-    ///         fn drop(&mut self) {
-    ///             self.0.store(true, Ordering::Relaxed);
-    ///         }
-    ///     }
-    ///     let _x = X(flag2);
-    ///     tx.send(()).unwrap();
+    ///     // make sure to move the drop detector inside this scope
+    ///     let _y = x;
+    ///     // wait forever
     ///     loop { ctx.recv().await; }
     /// });
     ///
-    /// tokio.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
+    /// // this will synchronously await termination of all actors and of the threads that run them
     /// drop(tokio);
     ///
+    /// // verify that indeed the `_y` was dropped inside the actor
     /// assert!(flag.load(Ordering::Relaxed));
     /// ```
     pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
@@ -98,7 +117,8 @@ impl AcTokioRuntime {
 
     /// Perform a task using the underlying runtime.
     ///
-    /// Beware that while this function is running, dropping the [`AcTokio`] handle will block until the task is finished.
+    /// Beware that while this function is running, dropping the [`AcTokio`] handle will block until the function is finished.
+    /// Returns `None` if the runtime has been dropped.
     pub fn with_rt<U>(&self, f: impl FnOnce(&Runtime) -> U) -> Option<U> {
         let _span = tracing::debug_span!("with_rt").entered();
         self.inner.rt.read().as_ref().map(f)

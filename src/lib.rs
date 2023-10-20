@@ -1,6 +1,7 @@
 //! Runtime-agnostic actor library for Rust
 //!
-//! Currently in early alpha stage: supports tokio for execution, currently only uses the MPSC channel, and still is quite slow.
+//! Currently in early alpha stage: supports tokio for execution, currently only uses the MPSC channel.
+//! Please refer to [`AcTokio`] for example usage.
 
 #![cfg_attr(all(doc, CHANNEL_NIGHTLY), feature(doc_auto_cfg))]
 

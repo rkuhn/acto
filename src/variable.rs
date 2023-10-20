@@ -7,7 +7,7 @@ struct Inner<T> {
 
 /// Write-side of a variable with read capability to use as single source of truth
 ///
-/// Usage of [`read`] and [`write`] should be non-blocking so that readers can always
+/// Usage of [`Self::read()`] and [`Self::write()`] should be non-blocking so that readers can always
 /// quickly access the latest value.
 #[derive(Clone)]
 pub struct Writer<T>(Arc<Inner<T>>);
