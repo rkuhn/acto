@@ -1,4 +1,4 @@
-use acto::{join, ActoCell, ActoInput, ActoRuntime, SupervisionRef};
+use acto::{ActoCell, ActoHandle, ActoInput, ActoRuntime, SupervisionRef};
 
 async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     println!("main actor started");
@@ -19,7 +19,7 @@ async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
             }
         });
         r.me.send(5 * m);
-        let result = join(r.handle).await;
+        let result = r.handle.join().await;
         println!("actor result: {:?}", result);
     }
 }
@@ -30,7 +30,7 @@ fn main() {
     let SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
     r.send(1);
     r.send(2);
-    let x = system.with_rt(|rt| rt.block_on(join(j)));
+    let x = system.with_rt(|rt| rt.block_on(j.join()));
     println!("result: {:?}", x);
 }
 

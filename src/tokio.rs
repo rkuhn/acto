@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::{
     any::Any,
-    future::{poll_fn, Future},
+    future::Future,
     ops::Deref,
     pin::Pin,
     sync::Arc,
@@ -23,7 +23,7 @@ impl AcTokio {
     /// Create a new [`AcTokio`] runtime with the given name and number of threads.
     ///
     /// ```
-    /// # use acto::{AcTokio, ActoInput, ActoRuntime};
+    /// # use acto::{AcTokio, ActoInput, ActoRuntime, ActoHandle};
     /// let rt = AcTokio::new("test", 1).unwrap();
     ///
     /// let actor = rt.spawn_actor("test", |mut ctx| async move {
@@ -34,7 +34,7 @@ impl AcTokio {
     /// // Send a message to the actor, after which it will terminate.
     /// actor.me.send("world".to_owned());
     /// // Wait for the actor to terminate.
-    /// rt.with_rt(|rt| rt.block_on(acto::join(actor.handle))).unwrap();
+    /// rt.with_rt(|rt| rt.block_on(actor.handle.join())).unwrap();
     /// ```
     ///
     /// In the above example the last step is crucial, without it nothing may be printed.
@@ -191,12 +191,6 @@ pub struct TokioJoinHandle<O>(
     Arc<Inner>,
 );
 
-impl<O: Send + 'static> TokioJoinHandle<O> {
-    pub fn join(mut self) -> impl Future<Output = Result<O, Box<dyn Any + Send + 'static>>> {
-        poll_fn(move |cx| self.poll(cx))
-    }
-}
-
 impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     type Output = O;
 
@@ -208,25 +202,28 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
         &self.1
     }
 
-    fn abort(&mut self) {
+    fn abort_pinned(self: Pin<&mut Self>) {
         tracing::debug!(name = ?self.0, handle = ?self.2.is_some(), "aborting");
-        let handle = self.2.take();
+        let handle = self.get_mut().2.take();
         if let Some(handle) = handle {
             handle.abort();
         }
     }
 
-    fn is_finished(&mut self) -> bool {
+    fn is_finished(&self) -> bool {
         self.2.as_ref().map(|h| h.is_finished()).unwrap_or(true)
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
-        if let Some(ref mut handle) = self.2 {
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
+        if let Some(handle) = &mut self.as_mut().get_mut().2 {
             Pin::new(handle)
                 .poll(cx)
                 .map(|r| r.map_err(|err| Box::new(err) as Box<dyn Any + Send + 'static>))
         } else {
-            Poll::Ready(Err(Box::new(ActoAborted::new(self.1.as_str()))))
+            Poll::Ready(Err(Box::new(ActoAborted::new(self.as_ref().1.as_str()))))
         }
     }
 }
@@ -234,7 +231,7 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
 #[cfg(test)]
 mod tests {
     use super::AcTokio;
-    use crate::{join, ActoCell, ActoId, ActoInput, ActoRuntime, SupervisionRef};
+    use crate::{ActoCell, ActoHandle, ActoId, ActoInput, ActoRuntime, SupervisionRef};
     use std::{
         collections::BTreeMap,
         sync::{
@@ -262,7 +259,7 @@ mod tests {
         r.send(());
         std::thread::sleep(Duration::from_millis(100));
         assert!(!flag.load(Ordering::Relaxed));
-        let ret = sys.with_rt(|rt| rt.block_on(join(j))).unwrap();
+        let ret = sys.with_rt(|rt| rt.block_on(j.join())).unwrap();
         assert_eq!(ret.unwrap(), 42);
     }
 
@@ -310,7 +307,7 @@ mod tests {
         r.send((2, tx));
         sys.with_rt(|rt| rt.block_on(rx)).unwrap().unwrap();
         drop(r);
-        let v = sys.with_rt(|rt| rt.block_on(join(j))).unwrap().unwrap();
+        let v = sys.with_rt(|rt| rt.block_on(j.join())).unwrap().unwrap();
         assert_eq!(v, vec![1, 1, 2, 2, 2, 4]);
     }
 }

@@ -1,9 +1,13 @@
 //! Runtime-agnostic actor library for Rust
 //!
-//! Currently in early alpha stage: supports tokio for execution, currently only uses the MPSC channel.
+//! Currently supports [`tokio`](https://docs.rs/tokio) for execution.
 //! Please refer to [`AcTokio`] for example usage.
+//!
+//! Actors combine well with sharing immutable snapshots, like [`futures-signals`](https://docs.rs/futures-signals).
 
 #![cfg_attr(all(doc, CHANNEL_NIGHTLY), feature(doc_auto_cfg))]
+// while acto works find with single-threaded runtimes, it must guarantee spawning on multi-threaded ones as well
+#![deny(clippy::future_not_send)]
 
 #[cfg(feature = "tokio")]
 mod tokio;
@@ -12,10 +16,9 @@ mod tokio;
 pub use crate::tokio::{AcTokio, AcTokioRuntime};
 
 mod actor;
-pub mod variable;
 
 pub use actor::{
-    join, ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
+    ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
     MailboxSize, MappedActoHandle, Receiver, Sender, SupervisionRef,
 };
 

@@ -185,6 +185,11 @@ impl<M: Send + 'static> ActoRef<M> {
     /// The employed channel may be at its capacity bound and the target actor may
     /// already be terminated, in which cases the message is dropped and `false` is
     /// returned.
+    ///
+    /// This method does not return the unsent message in the above cases because the
+    /// message may not be delivered even though `true` is returned. In other words,
+    /// you cannot rely on the return value to conclude that the message was delivered.
+    /// Instead, have the target actor send a confirmation message back to you.
     pub fn send(&self, msg: M) -> bool {
         tracing::trace!(target = ?self, "send");
         self.0.sender.send(msg)
@@ -213,6 +218,8 @@ impl<M: Send + 'static> ActoRef<M> {
             Inner::Mapped(x) => Inner::Mapped(*x),
             Inner::Blackhole => Inner::Blackhole,
         };
+        let count = self.with_count(|c| c.fetch_add(1, Ordering::SeqCst));
+        tracing::trace!(count, ?self, "contramap");
         let orig = self.0.clone();
         let inner = ActoRefInner {
             fields,
@@ -229,14 +236,17 @@ impl<M: Send + 'static> ActoRef<M> {
 
 impl<M> Clone for ActoRef<M> {
     fn clone(&self) -> Self {
-        self.with_count(|c| c.fetch_add(1, Ordering::SeqCst));
+        let count = self.with_count(|c| c.fetch_add(1, Ordering::SeqCst));
+        tracing::trace!(count, ?self, "clone");
         Self(self.0.clone())
     }
 }
 
 impl<M> Drop for ActoRef<M> {
     fn drop(&mut self) {
-        if self.with_count(|c| c.fetch_sub(1, Ordering::SeqCst)) == 1 {
+        let count = self.with_count(|c| c.fetch_sub(1, Ordering::SeqCst));
+        tracing::trace!(count, ?self, "drop");
+        if count == 1 {
             self.wake()
         }
     }
@@ -244,7 +254,7 @@ impl<M> Drop for ActoRef<M> {
 
 impl<M> Debug for ActoRef<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ActorRef({})", self.name())
+        write!(f, "ActoRef({})", self.name())
     }
 }
 
@@ -272,18 +282,21 @@ impl fmt::Display for ActoAborted {
 ///
 /// Every actor is provided with an `ActoCell` when it is started, which is its
 /// means of interacting with other actors.
+///
+/// The type parameter `R` is present so that the Actor can formulate further
+/// requirements in its type signature (e.g. `R: MailboxSize`).
 pub struct ActoCell<M: Send + 'static, R: ActoRuntime, S: 'static = ()> {
     me: ActoRef<M>,
     runtime: R,
     recv: R::Receiver<M>,
-    supervised: Vec<Box<dyn ActoHandle<Output = S>>>,
+    supervised: Vec<Pin<Box<dyn ActoHandle<Output = S>>>>,
     no_senders_signaled: bool,
 }
 
 impl<M: Send + 'static, R: ActoRuntime, S: 'static> Drop for ActoCell<M, R, S> {
     fn drop(&mut self) {
         for mut h in self.supervised.drain(..) {
-            h.abort();
+            h.as_mut().abort_pinned();
         }
         self.me.dead();
     }
@@ -311,7 +324,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
     pub fn recv(&mut self) -> impl Future<Output = ActoInput<M, S>> + '_ {
         poll_fn(|cx| {
             for idx in 0..self.supervised.len() {
-                let p = self.supervised[idx].poll(cx);
+                let p = self.supervised[idx].as_mut().poll(cx);
                 if let Poll::Ready(result) = p {
                     let handle = self.supervised.remove(idx);
                     tracing::trace!(src = ?handle.name(), "supervision");
@@ -356,7 +369,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
     ///     // spawn and forget
     ///     cell.spawn("name", |cell: ActoCell<i32, _>| async move { todo!() });
     ///     // spawn, retrieve handle, do not supervise
-    ///     let a_ref = cell.spawn("super", |mut cell| async move {
+    ///     let a_ref = cell.spawn("super", |mut cell: ActoCell<_, _, ()>| async move {
     ///         if let ActoInput::Message(msg) = cell.recv().await {
     ///             cell.supervise(msg);
     ///         }
@@ -366,7 +379,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
     ///     a_ref.send(s_ref);
     /// }
     /// ```
-    pub fn spawn<M2: Send + 'static, F, Fut, S2>(
+    pub fn spawn<M2, F, Fut, S2>(
         &self,
         name: &str,
         actor: F,
@@ -376,20 +389,19 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
         S2: Send + 'static,
+        M2: Send + 'static,
     {
         self.runtime.spawn_actor(name, actor)
     }
 
     /// Create a new actor on the same [`ActoRuntime`] as the current one and [`ActoCell::supervise`] it.
-    pub fn spawn_supervised<M2: Send + 'static, F, Fut, S2>(
-        &mut self,
-        name: &str,
-        actor: F,
-    ) -> ActoRef<M2>
+    pub fn spawn_supervised<M2, F, Fut, S2, O>(&mut self, name: &str, actor: F) -> ActoRef<M2>
     where
         F: FnOnce(ActoCell<M2, R, S2>) -> Fut,
-        Fut: Future<Output = S> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: Into<S> + Send + 'static,
         S2: Send + 'static,
+        M2: Send + 'static,
     {
         self.supervise(self.spawn(name, actor))
     }
@@ -398,13 +410,15 @@ impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
     ///
     /// When that actor terminates, this actor will receive [`ActoInput::Supervision`] for it.
     /// When this actor terminates, all supervised actors will be aborted.
-    pub fn supervise<T, H>(&mut self, actor: SupervisionRef<T, H>) -> ActoRef<T>
+    pub fn supervise<T, H, O>(&mut self, actor: SupervisionRef<T, H>) -> ActoRef<T>
     where
         T: Send + 'static,
-        H: ActoHandle<Output = S> + Send + 'static,
+        H: ActoHandle<Output = O> + Send + 'static,
+        O: Into<S> + Send + 'static,
     {
         tracing::trace!(target = ?actor.me.name(), "supervise");
-        self.supervised.push(Box::new(actor.handle));
+        self.supervised
+            .push(Box::pin(actor.handle.map(|x: O| x.into())));
         actor.me
     }
 }
@@ -474,7 +488,7 @@ impl<M: Send + 'static, H: ActoHandle> SupervisionRef<M, H> {
     /// Map the return type of the contained [`ActoHandle`] to match the intended supervisor.
     ///
     /// ```rust
-    /// # use acto::{ActoCell, ActoInput, ActoRef, ActoRuntime, SupervisionRef, AcTokio, join};
+    /// # use acto::{ActoCell, ActoInput, ActoRef, ActoRuntime, SupervisionRef, AcTokio, ActoHandle};
     /// async fn top_level(mut cell: ActoCell<(), impl ActoRuntime, String>) -> ActoInput<(), String> {
     ///     let actor = cell.spawn("actor", |mut cell: ActoCell<(), _>| async move {
     ///         // some async computation that leads to the result
@@ -488,7 +502,7 @@ impl<M: Send + 'static, H: ActoHandle> SupervisionRef<M, H> {
     /// # let sys = AcTokio::new("doc", 1).unwrap();
     /// # let ah = sys.spawn_actor("top", top_level);
     /// # let ah = ah.handle;
-    /// # let ActoInput::Supervision { name, result, ..} = sys.with_rt(|rt| rt.block_on(join(ah))).unwrap().unwrap() else { panic!("wat") };
+    /// # let ActoInput::Supervision { name, result, ..} = sys.with_rt(|rt| rt.block_on(ah.join())).unwrap().unwrap() else { panic!("wat") };
     /// # assert!(name.starts_with("actor(doc/"));
     /// # assert_eq!(result.unwrap(), "42");
     /// ```
@@ -758,7 +772,7 @@ pub trait Receiver<M>: Send + 'static {
 }
 
 /// A handle for aborting or joining a running actor.
-pub trait ActoHandle: Unpin + Send + Sync + 'static {
+pub trait ActoHandle: Send + 'static {
     type Output;
 
     /// The ID of the underlying actor.
@@ -769,10 +783,29 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
 
     /// Abort the actor’s task.
     ///
+    /// Use this method if you don’t need the handle afterwards; otherwise use [`abort_pinned`].
     /// Behaviour is undefined if the actor is not [cancellation safe].
     ///
     /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
-    fn abort(&mut self);
+    fn abort(mut self)
+    where
+        Self: Sized,
+    {
+        // safety:
+        // - we drop `self` at the end of the scope without moving it
+        // - we don’t use Deref or DerefMut; if the implementor does, it’s their responsibility
+        let this = unsafe { Pin::new_unchecked(&mut self) };
+        this.abort_pinned();
+    }
+
+    /// Abort the actor’s task.
+    ///
+    /// Use this method if you want to [`join`] the actor’s task later, otherwise
+    /// prefer the [`abort`] method that can be called without pinning first.
+    /// Behaviour is undefined if the actor is not [cancellation safe].
+    ///
+    /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
+    fn abort_pinned(self: Pin<&mut Self>);
 
     /// Check whether the actor’s task is no longer running
     ///
@@ -783,12 +816,12 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
     /// the actor is still capable of receiving messages. An actor could drop its
     /// [`ActoCell`] (yielding `true` there) or it could move it to another async task
     /// (yielding `true` here).
-    fn is_finished(&mut self) -> bool;
+    fn is_finished(&self) -> bool;
 
     /// Poll this handle for whether the actor is now terminated.
     ///
     /// This method has [`Future`] semantics.
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Output, BoxErr>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Self::Output, BoxErr>>;
 
     /// Transform the output value of this handle, e.g. before calling [`ActoCell::supervise`].
     fn map<O, F>(self, transform: F) -> MappedActoHandle<Self, F, O>
@@ -797,28 +830,39 @@ pub trait ActoHandle: Unpin + Send + Sync + 'static {
     {
         MappedActoHandle::new(self, transform)
     }
+
+    /// A future for awaiting the termination of the actor underlying this handle.
+    fn join(self) -> ActoHandleFuture<Self>
+    where
+        Self: Sized,
+    {
+        ActoHandleFuture { handle: self }
+    }
 }
 
-/// A future for awaiting the termination of the actor underlying the given handle.
-pub fn join<J: ActoHandle>(handle: J) -> impl Future<Output = Result<J::Output, BoxErr>> {
-    ActoHandleFuture(handle)
+pin_project_lite::pin_project! {
+    /// The future returned by [`ActoHandle::join`].
+    pub struct ActoHandleFuture<J> {
+        #[pin] handle: J
+    }
 }
 
-struct ActoHandleFuture<J>(J);
 impl<J: ActoHandle> Future for ActoHandleFuture<J> {
     type Output = Result<J::Output, BoxErr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _span = tracing::debug_span!("poll", join = ?self.as_ref().0.name());
-        self.get_mut().0.poll(cx)
+        let _span = tracing::debug_span!("poll", join = ?self.as_ref().handle.name());
+        self.project().handle.poll(cx)
     }
 }
 
-/// An [`ActoHandle`] that results from [`ActoHandle::map`].
-pub struct MappedActoHandle<H, F, O> {
-    inner: H,
-    transform: Option<F>,
-    _ph: PhantomData<O>,
+pin_project_lite::pin_project! {
+    /// An [`ActoHandle`] that results from [`ActoHandle::map`].
+    pub struct MappedActoHandle<H, F, O> {
+        #[pin] inner: H,
+        transform: Option<F>,
+        _ph: PhantomData<O>,
+    }
 }
 
 impl<H, F, O> MappedActoHandle<H, F, O> {
@@ -835,7 +879,7 @@ impl<H, F, O> ActoHandle for MappedActoHandle<H, F, O>
 where
     H: ActoHandle,
     F: FnOnce(H::Output) -> O + Send + Sync + Unpin + 'static,
-    O: Send + Sync + Unpin + 'static,
+    O: Send + 'static,
 {
     type Output = O;
 
@@ -847,17 +891,18 @@ where
         self.inner.name()
     }
 
-    fn abort(&mut self) {
-        self.inner.abort()
+    fn abort_pinned(self: Pin<&mut Self>) {
+        self.project().inner.abort_pinned()
     }
 
-    fn is_finished(&mut self) -> bool {
+    fn is_finished(&self) -> bool {
         self.inner.is_finished()
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, BoxErr>> {
-        self.inner.poll(cx).map(|r| {
-            let transform = self.transform.take().expect("polled after finish");
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<O, BoxErr>> {
+        let this = self.project();
+        this.inner.poll(cx).map(|r| {
+            let transform = this.transform.take().expect("polled after finish");
             r.map(transform)
         })
     }
