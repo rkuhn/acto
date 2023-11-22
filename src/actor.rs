@@ -303,7 +303,7 @@ impl<M: Send + 'static, R: ActoRuntime, S: 'static> Drop for ActoCell<M, R, S> {
 }
 
 impl<M: Send + 'static, R: ActoRuntime, S: Send + 'static> ActoCell<M, R, S> {
-    /// Get access to the [`ActoRuntime`] driving this actor, e.g. to customise mailbox size for spawned actors.
+    /// Get access to the [`ActoRuntime`] driving this actor, e.g. to customize mailbox size for spawned actors.
     ///
     /// See [`MailboxSize`].
     pub fn rt(&self) -> &R {
@@ -734,7 +734,7 @@ fn test_write_id() {
     assert_eq!(write_id(&mut buf, ActoId(100)), "64");
 }
 
-/// This trait is implemented by [`ActoRuntime`]s that allow customisation of the mailbox size.
+/// This trait is implemented by [`ActoRuntime`]s that allow customization of the mailbox size.
 ///
 /// ```rust
 /// # use acto::{ActoCell, ActoRef, ActoRuntime, MailboxSize};
@@ -784,7 +784,7 @@ pub trait ActoHandle: Send + 'static {
     /// Abort the actor’s task.
     ///
     /// Use this method if you don’t need the handle afterwards; otherwise use [`abort_pinned`].
-    /// Behaviour is undefined if the actor is not [cancellation safe].
+    /// Behavior is undefined if the actor is not [cancellation safe].
     ///
     /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
     fn abort(mut self)
@@ -802,7 +802,7 @@ pub trait ActoHandle: Send + 'static {
     ///
     /// Use this method if you want to [`join`] the actor’s task later, otherwise
     /// prefer the [`abort`] method that can be called without pinning first.
-    /// Behaviour is undefined if the actor is not [cancellation safe].
+    /// Behavior is undefined if the actor is not [cancellation safe].
     ///
     /// [cancellation safe]: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
     fn abort_pinned(self: Pin<&mut Self>);
