@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    runtime::{Builder, Runtime},
+    runtime::{Builder, Handle, Runtime},
     sync::mpsc,
 };
 
@@ -72,6 +72,14 @@ impl AcTokio {
     pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
         Ok(Self(AcTokioRuntime::new(name, num_threads)?))
     }
+
+    /// Create a new [`AcTokio`] runtime from an existing [`tokio::runtime::Handle`].
+    ///
+    /// This is useful if you want to use an existing tokio runtime, for example if you want to use [`acto`] in a library.
+    /// Dropping this handle will not abort the actors spawned by this runtime.
+    pub fn from_handle(name: impl Into<String>, handle: Handle) -> Self {
+        Self(AcTokioRuntime::from_handle(name, handle))
+    }
 }
 
 impl Deref for AcTokio {
@@ -109,25 +117,53 @@ impl AcTokioRuntime {
         Ok(Self {
             inner: Arc::new(Inner {
                 name,
-                rt: RwLock::new(Some(rt)),
+                rt: RwLock::new(Some(RuntimeOrHandle::Runtime(rt))),
             }),
             mailbox_size: 128,
         })
+    }
+
+    fn from_handle(name: impl Into<String>, handle: Handle) -> Self {
+        let name = name.into();
+        tracing::debug!(%name, "creating");
+        Self {
+            inner: Arc::new(Inner {
+                name,
+                rt: RwLock::new(Some(RuntimeOrHandle::Handle(handle))),
+            }),
+            mailbox_size: 128,
+        }
     }
 
     /// Perform a task using the underlying runtime.
     ///
     /// Beware that while this function is running, dropping the [`AcTokio`] handle will block until the function is finished.
     /// Returns `None` if the runtime has been dropped.
-    pub fn with_rt<U>(&self, f: impl FnOnce(&Runtime) -> U) -> Option<U> {
+    pub fn with_rt<U>(&self, f: impl FnOnce(&Handle) -> U) -> Option<U> {
         let _span = tracing::debug_span!("with_rt").entered();
-        self.inner.rt.read().as_ref().map(f)
+        self.inner.rt.read().as_ref().map(|rt| f(&*rt))
+    }
+}
+
+enum RuntimeOrHandle {
+    Runtime(Runtime),
+    Handle(Handle),
+}
+
+impl Deref for RuntimeOrHandle {
+    type Target = Handle;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Runtime(rt) => rt.handle(),
+            Self::Handle(h) => h,
+        }
     }
 }
 
 struct Inner {
     name: String,
-    rt: RwLock<Option<Runtime>>,
+    rt: RwLock<Option<RuntimeOrHandle>>,
 }
 
 impl ActoRuntime for AcTokioRuntime {
