@@ -13,7 +13,7 @@
 mod tokio;
 
 #[cfg(feature = "tokio")]
-pub use crate::tokio::{AcTokio, AcTokioRuntime};
+pub use crate::tokio::{AcTokio, AcTokioRuntime, TokioJoinHandle};
 
 mod actor;
 
