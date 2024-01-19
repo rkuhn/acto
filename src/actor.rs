@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use smol_str::SmolStr;
 use std::{
     any::Any,
-    fmt::{self, Debug},
+    fmt::{self, Debug, Display},
     future::{poll_fn, Future},
     hash::Hash,
     marker::PhantomData,
@@ -257,8 +257,34 @@ impl<M> Debug for ActoRef<M> {
         write!(f, "ActoRef({})", self.name())
     }
 }
+pub enum PanicOrAbort {
+    Panic(Box<dyn PanicInfo>),
+    Abort(ActoAborted),
+}
 
-type BoxErr = Box<dyn Any + Send + 'static>;
+impl Display for PanicOrAbort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PanicOrAbort::Panic(p) => write!(f, "Actor panicked: {}", p.cause()),
+            PanicOrAbort::Abort(_) => write!(f, "Actor aborted via Acto"),
+        }
+    }
+}
+
+impl Debug for PanicOrAbort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Panic(arg0) => f.debug_tuple("Panic").field(arg0).finish(),
+            Self::Abort(arg0) => Debug::fmt(arg0, f),
+        }
+    }
+}
+
+pub trait PanicInfo: Debug + Send + 'static {
+    fn payload(&self) -> Option<&(dyn Any + Send + 'static)>;
+    fn is_cancelled(&self) -> bool;
+    fn cause(&self) -> String;
+}
 
 /// This error is returned when an actor has been aborted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -541,7 +567,7 @@ pub enum ActoInput<M, S> {
     Supervision {
         id: ActoId,
         name: String,
-        result: Result<S, BoxErr>,
+        result: Result<S, PanicOrAbort>,
     },
     /// A message has been received via our [`ActoRef`] handle.
     Message(M),
@@ -602,7 +628,7 @@ pub enum ActoMsgSuper<M, S> {
     Supervision {
         id: ActoId,
         name: String,
-        result: Result<S, BoxErr>,
+        result: Result<S, PanicOrAbort>,
     },
     /// A message has been received via our [`ActoRef`] handle.
     Message(M),
@@ -821,7 +847,8 @@ pub trait ActoHandle: Send + 'static {
     /// Poll this handle for whether the actor is now terminated.
     ///
     /// This method has [`Future`] semantics.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Self::Output, BoxErr>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>)
+        -> Poll<Result<Self::Output, PanicOrAbort>>;
 
     /// Transform the output value of this handle, e.g. before calling [`ActoCell::supervise`].
     fn map<O, F>(self, transform: F) -> MappedActoHandle<Self, F, O>
@@ -848,7 +875,7 @@ pin_project_lite::pin_project! {
 }
 
 impl<J: ActoHandle> Future for ActoHandleFuture<J> {
-    type Output = Result<J::Output, BoxErr>;
+    type Output = Result<J::Output, PanicOrAbort>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _span = tracing::debug_span!("poll", join = ?self.as_ref().handle.name());
@@ -899,7 +926,7 @@ where
         self.inner.is_finished()
     }
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<O, BoxErr>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<O, PanicOrAbort>> {
         let this = self.project();
         this.inner.poll(cx).map(|r| {
             let transform = this.transform.take().expect("polled after finish");

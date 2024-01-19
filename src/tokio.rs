@@ -1,4 +1,7 @@
-use crate::{actor::ActoAborted, ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender};
+use crate::{
+    actor::{ActoAborted, PanicInfo, PanicOrAbort},
+    ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender,
+};
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::{
@@ -12,6 +15,7 @@ use std::{
 use tokio::{
     runtime::{Builder, Handle, Runtime},
     sync::mpsc,
+    task::JoinError,
 };
 
 /// Owned handle to an [`AcTokioRuntime`].
@@ -76,7 +80,8 @@ impl AcTokio {
     /// Create a new [`AcTokio`] runtime from an existing [`tokio::runtime::Handle`].
     ///
     /// This is useful if you want to use an existing tokio runtime, for example if you want to use [`acto`] in a library.
-    /// Dropping this handle will not abort the actors spawned by this runtime.
+    /// Dropping this value will not abort the actors spawned by this runtime, but it will prevent new actors from
+    /// being spawned, so make sure to keep it around long enough!
     pub fn from_handle(name: impl Into<String>, handle: Handle) -> Self {
         Self(AcTokioRuntime::from_handle(name, handle))
     }
@@ -250,16 +255,60 @@ impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
         self.2.as_ref().map(|h| h.is_finished()).unwrap_or(true)
     }
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<O, Box<dyn Any + Send + 'static>>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<O, PanicOrAbort>> {
         if let Some(handle) = &mut self.as_mut().get_mut().2 {
-            Pin::new(handle)
-                .poll(cx)
-                .map(|r| r.map_err(|err| Box::new(err) as Box<dyn Any + Send + 'static>))
+            Pin::new(handle).poll(cx).map(|r| {
+                r.map_err(|err| {
+                    tracing::debug!(?err, "actor aborted");
+                    PanicOrAbort::Panic(Box::new(TokioPanic::from(err)))
+                })
+            })
         } else {
-            Poll::Ready(Err(Box::new(ActoAborted::new(self.as_ref().1.as_str()))))
+            tracing::debug!("actor aborted");
+            Poll::Ready(Err(PanicOrAbort::Abort(ActoAborted::new(
+                self.as_ref().1.as_str(),
+            ))))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TokioPanic {
+    Join(Box<dyn Any + Send + 'static>),
+    Cancelled,
+}
+
+impl PanicInfo for TokioPanic {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    fn payload(&self) -> Option<&(dyn Any + Send + 'static)> {
+        match self {
+            TokioPanic::Join(j) => Some(j.as_ref()),
+            TokioPanic::Cancelled => None,
+        }
+    }
+
+    fn cause(&self) -> String {
+        match self {
+            TokioPanic::Join(j) => j
+                .downcast_ref::<&'static str>()
+                .map(|s| *s)
+                .or_else(|| j.downcast_ref::<String>().map(|s| &**s))
+                .unwrap_or("opaque panic")
+                .to_owned(),
+            TokioPanic::Cancelled => "cancelled via Tokio".to_owned(),
+        }
+    }
+}
+
+impl From<JoinError> for TokioPanic {
+    fn from(err: JoinError) -> Self {
+        if err.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Join(err.into_panic())
         }
     }
 }
