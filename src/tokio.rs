@@ -195,7 +195,6 @@ impl ActoRuntime for AcTokioRuntime {
             id,
             name,
             self.inner.rt.read().as_ref().map(|rt| rt.spawn(task)),
-            self.inner.clone(),
         )
     }
 }
@@ -225,12 +224,7 @@ impl<M: Send + 'static> Receiver<M> for TokioReceiver<M> {
     }
 }
 
-pub struct TokioJoinHandle<O>(
-    ActoId,
-    SmolStr,
-    Option<tokio::task::JoinHandle<O>>,
-    Arc<Inner>,
-);
+pub struct TokioJoinHandle<O>(ActoId, SmolStr, Option<tokio::task::JoinHandle<O>>);
 
 impl<O: Send + 'static> ActoHandle for TokioJoinHandle<O> {
     type Output = O;

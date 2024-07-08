@@ -741,7 +741,7 @@ fn write_id(buf: &mut [u8; 16], id: ActoId) -> &str {
         return "0";
     }
     let mut written = 0;
-    let mut shift = (16 - (id.leading_zeros()) / 4) * 4;
+    let mut shift = (id.ilog2() & !3) + 4;
     while shift != 0 {
         shift -= 4;
         const HEX: [u8; 16] = *b"0123456789abcdef";
@@ -754,10 +754,13 @@ fn write_id(buf: &mut [u8; 16], id: ActoId) -> &str {
 #[test]
 fn test_write_id() {
     let mut buf = [0u8; 16];
-    assert_eq!(write_id(&mut buf, ActoId(0)), "0");
-    assert_eq!(write_id(&mut buf, ActoId(1)), "1");
-    assert_eq!(write_id(&mut buf, ActoId(10)), "a");
-    assert_eq!(write_id(&mut buf, ActoId(100)), "64");
+    for i in 0..1000000 {
+        assert_eq!(write_id(&mut buf, ActoId(i)), &format!("{:x}", i));
+    }
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(write_id(&mut buf, ActoId(usize::MAX)), "ffffffffffffffff");
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(write_id(&mut buf, ActoId(usize::MAX)), "ffffffff");
 }
 
 /// This trait is implemented by [`ActoRuntime`]s that allow customization of the mailbox size.
