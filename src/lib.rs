@@ -19,7 +19,7 @@ mod actor;
 
 pub use actor::{
     ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
-    MailboxSize, MappedActoHandle, Receiver, Sender, SupervisionRef,
+    MailboxSize, MappedActoHandle, PanicInfo, PanicOrAbort, Receiver, Sender, SupervisionRef,
 };
 
 #[cfg(test)]
