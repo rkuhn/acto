@@ -5,7 +5,6 @@
 //!
 //! Actors combine well with sharing immutable snapshots, like [`futures-signals`](https://docs.rs/futures-signals).
 
-#![cfg_attr(all(doc, CHANNEL_NIGHTLY), feature(doc_auto_cfg))]
 // while acto works fine with single-threaded runtimes, it must guarantee spawning on multi-threaded ones as well
 #![deny(clippy::future_not_send)]
 
@@ -16,6 +15,7 @@ mod tokio;
 pub use crate::tokio::{AcTokio, AcTokioRuntime, TokioJoinHandle};
 
 mod actor;
+pub mod variable;
 
 pub use actor::{
     ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
