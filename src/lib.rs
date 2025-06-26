@@ -14,13 +14,24 @@ mod tokio;
 #[cfg(feature = "tokio")]
 pub use crate::tokio::{AcTokio, AcTokioRuntime, TokioJoinHandle};
 
-mod actor;
+mod abort;
+mod acto_cell;
+mod acto_handle;
+mod acto_ref;
+mod messages;
+mod runtime;
+mod snd_rcv;
+mod supervision_ref;
 pub mod variable;
 
-pub use actor::{
-    ActoAborted, ActoCell, ActoHandle, ActoId, ActoInput, ActoMsgSuper, ActoRef, ActoRuntime,
-    MailboxSize, MappedActoHandle, PanicInfo, PanicOrAbort, Receiver, Sender, SupervisionRef,
-};
+pub use abort::{ActoAborted, PanicInfo, PanicOrAbort};
+pub use acto_cell::ActoCell;
+pub use acto_handle::{ActoHandle, MappedActoHandle};
+pub use acto_ref::{ActoId, ActoRef};
+pub use messages::{ActoInput, ActoMsgSuper};
+pub use runtime::{ActoRuntime, MailboxSize};
+pub use snd_rcv::{Receiver, Sender};
+pub use supervision_ref::SupervisionRef;
 
 #[cfg(test)]
 mod tests;

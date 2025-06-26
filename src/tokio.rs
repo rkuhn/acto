@@ -1,11 +1,11 @@
 use crate::{
-    actor::{ActoAborted, PanicInfo, PanicOrAbort},
-    ActoHandle, ActoId, ActoRuntime, MailboxSize, Receiver, Sender,
+    runtime::MailboxSize, ActoAborted, ActoHandle, ActoId, ActoRuntime, PanicInfo, PanicOrAbort,
+    Receiver, Sender,
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::{
-    any::Any,
+    any::{type_name, Any},
     future::Future,
     ops::Deref,
     pin::Pin,
@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{
     runtime::{Builder, Handle, Runtime},
-    sync::mpsc,
+    sync::mpsc::{self, error::TrySendError},
     task::JoinError,
 };
 
@@ -213,7 +213,37 @@ impl MailboxSize for AcTokioRuntime {
 pub struct TokioSender<M>(mpsc::Sender<M>);
 impl<M: Send + 'static> Sender<M> for TokioSender<M> {
     fn send(&self, msg: M) -> bool {
-        self.0.try_send(msg).is_ok()
+        if let Err(e) = self.0.try_send(msg) {
+            match e {
+                TrySendError::Full(_) => {
+                    tracing::debug!(
+                        msg = type_name::<M>(),
+                        "dropping message due to full mailbox"
+                    );
+                }
+                TrySendError::Closed(_) => {
+                    tracing::debug!(
+                        msg = type_name::<M>(),
+                        "dropping message due to closed mailbox"
+                    );
+                }
+            }
+            return false;
+        }
+        true
+    }
+    fn send_wait(&self, msg: M) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
+        let tx = self.0.clone();
+        Box::pin(async move {
+            if let Err(_) = tx.send(msg).await {
+                tracing::debug!(
+                    msg = type_name::<M>(),
+                    "dropping message due to closed mailbox"
+                );
+                return false;
+            }
+            true
+        })
     }
 }
 
