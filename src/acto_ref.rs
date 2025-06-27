@@ -211,7 +211,9 @@ impl<M: Send + 'static> ActoRef<M> {
         self.0.sender.send(msg)
     }
 
-    /// Send a message to the referenced actor and wait for it to be delivered.
+    /// Send a message to the referenced actor and wait for it to be enqueued in its mailbox.
+    /// If you need confirmation that the message was delivered, let the target actor send a
+    /// confirmation message back to you.
     ///
     /// This method returns `false` if the message is dropped due to the target
     /// mailbox being closed (which is always true for [`ActoRef::blackhole`]).
