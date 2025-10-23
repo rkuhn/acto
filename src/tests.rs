@@ -2,7 +2,10 @@
 
 use crate::{tokio::AcTokio, ActoCell, ActoHandle, ActoInput, ActoRuntime, SupervisionRef};
 use std::{pin::Pin, sync::Arc, time::Duration};
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    sync::oneshot,
+    time::{sleep, timeout},
+};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 macro_rules! assert_timed {
@@ -22,7 +25,7 @@ fn supervisor_termination() {
         .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .with_test_writer()
         .init();
-    let sys = AcTokio::new("test", 2).unwrap();
+    let sys = AcTokio::new("test").unwrap();
 
     let probe = Arc::new(());
 
@@ -69,7 +72,7 @@ fn supervisor_termination() {
 
 #[test]
 fn termination_info() {
-    let sys = AcTokio::new("test", 2).unwrap();
+    let sys = AcTokio::new("test").unwrap();
     let SupervisionRef {
         me: r,
         handle: mut j,
@@ -80,6 +83,7 @@ fn termination_info() {
     });
     assert!(!r.is_gone());
     assert!(!j.is_finished());
+    sys.with_rt(|rt| rt.block_on(async { sleep(Duration::from_millis(100)).await }));
     Pin::new(&mut j).abort_pinned();
     assert_timed!(j.is_finished());
     assert!(r.is_gone());

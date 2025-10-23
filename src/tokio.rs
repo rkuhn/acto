@@ -24,7 +24,9 @@ use tokio::{
 pub struct AcTokio(AcTokioRuntime);
 
 impl AcTokio {
-    /// Create a new [`AcTokio`] runtime with the given name and number of threads.
+    /// Create a new [`AcTokio`] runtime with the given name.
+    ///
+    /// Actors will be scheduled on the current thread.
     ///
     /// ```
     /// # use acto::{AcTokio, ActoInput, ActoRuntime, ActoHandle};
@@ -73,8 +75,17 @@ impl AcTokio {
     /// // verify that indeed the `_y` was dropped inside the actor
     /// assert!(flag.load(Ordering::Relaxed));
     /// ```
-    pub fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
-        Ok(Self(AcTokioRuntime::new(name, num_threads)?))
+    pub fn new(name: impl Into<String>) -> std::io::Result<Self> {
+        Ok(Self(AcTokioRuntime::new(name)?))
+    }
+
+    /// Create a new [`AcTokio`] runtime with the given name and number of threads.
+    ///
+    /// Actors will be scheduled in the background threads of the runtime.
+    /// For examples see [`new`](Self::new).
+    #[cfg(feature = "rt-multi-thread")]
+    pub fn new_multi_thread(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
+        Ok(Self(AcTokioRuntime::new_multi_thread(name, num_threads)?))
     }
 
     /// Create a new [`AcTokio`] runtime from an existing [`tokio::runtime::Handle`].
@@ -111,7 +122,21 @@ pub struct AcTokioRuntime {
 }
 
 impl AcTokioRuntime {
-    fn new(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
+    fn new(name: impl Into<String>) -> std::io::Result<Self> {
+        let name = name.into();
+        tracing::debug!(%name, "creating");
+        let rt = Builder::new_current_thread().enable_all().build()?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                name,
+                rt: RwLock::new(Some(RuntimeOrHandle::Runtime(rt))),
+            }),
+            mailbox_size: 128,
+        })
+    }
+
+    #[cfg(feature = "rt-multi-thread")]
+    fn new_multi_thread(name: impl Into<String>, num_threads: usize) -> std::io::Result<Self> {
         let name = name.into();
         tracing::debug!(%name, ?num_threads, "creating");
         let rt = Builder::new_multi_thread()
@@ -353,7 +378,7 @@ mod tests {
 
     #[test]
     fn run() {
-        let sys = AcTokio::new("test", 1).unwrap();
+        let sys = AcTokio::new("test").unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let flag2 = flag.clone();
         let SupervisionRef { me: r, handle: j } =
@@ -374,7 +399,7 @@ mod tests {
 
     #[test]
     fn child() {
-        let sys = AcTokio::new("test", 2).unwrap();
+        let sys = AcTokio::new_multi_thread("test", 2).unwrap();
         let SupervisionRef { me: r, handle: j } = sys.spawn_actor(
             "super",
             |mut ctx: ActoCell<_, _, Result<i32, i32>>| async move {

@@ -24,9 +24,9 @@ async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", feature = "rt-multi-thread"))]
 fn main() {
-    let system = acto::AcTokio::new("theMain", 2).unwrap();
+    let system = acto::AcTokio::new_multi_thread("theMain", 2).unwrap();
     let SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
     r.send(1);
     r.send(2);
@@ -34,7 +34,7 @@ fn main() {
     println!("result: {:?}", x);
 }
 
-#[cfg(not(feature = "tokio"))]
+#[cfg(not(all(feature = "tokio", feature = "rt-multi-thread")))]
 fn main() {
     println!("This example requires the 'tokio' feature");
 }

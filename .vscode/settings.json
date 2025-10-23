@@ -1,4 +1,4 @@
 {
   "rust-analyzer.linkedProjects": ["./Cargo.toml"],
-  "rust-analyzer.cargo.features": ["tokio"]
+  "rust-analyzer.cargo.features": ["tokio", "rt-multi-thread"]
 }
