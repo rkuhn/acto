@@ -65,6 +65,18 @@ pub trait ActoRuntime: Clone + Send + Sync + 'static {
 pin_project_lite::pin_project! {
     struct LoggingTask<F> {
         name: SmolStr,
+        // Span is constructed once at task creation and kept alive
+        // for the task's entire lifetime. Re-creating a fresh span
+        // on every `poll()` (the previous behaviour) makes the span
+        // refcount drop to zero between polls, so any inner future
+        // that captured a reference to "the current span" — for
+        // example via `Span::current()` — could later trigger
+        // `tracing-subscriber`'s sharded registry assertion
+        // `assert_ne!(refs, 0, "tried to clone a span that already
+        // closed")` from `clone_span`. Reproduced under heavy load
+        // on the `swarm-discovery` + `iroh-mdns` stack inside the
+        // `wwkg-custodian` daemon.
+        span: tracing::Span,
         #[pin]
         future: F,
     }
@@ -72,7 +84,8 @@ pin_project_lite::pin_project! {
 
 impl<F> LoggingTask<F> {
     pub fn new(name: SmolStr, future: F) -> Self {
-        Self { name, future }
+        let span = tracing::debug_span!("poll", actor = %name);
+        Self { name, span, future }
     }
 }
 
@@ -85,7 +98,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let _span = tracing::debug_span!("poll", actor = %this.name).entered();
+        let _entered = this.span.enter();
         this.future.poll(cx)
     }
 }
