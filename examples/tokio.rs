@@ -1,6 +1,6 @@
-use acto::{ActoCell, ActoHandle, ActoInput, ActoRuntime, SupervisionRef};
+use acto::{ActoCell, ActoHandle, ActoInput, ActoRuntime};
 
-async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
+pub async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
     println!("main actor started");
     while let ActoInput::Message(m) = ctx.recv().await {
         ctx.spawn_supervised("subordinate", |mut ctx: ActoCell<_, _>| async move {
@@ -27,7 +27,7 @@ async fn actor(mut ctx: ActoCell<i32, impl ActoRuntime>) {
 #[cfg(feature = "tokio")]
 fn main() {
     let system = acto::AcTokio::new("theMain", 2).unwrap();
-    let SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
+    let acto::SupervisionRef { me: r, handle: j } = system.spawn_actor("supervisor", actor);
     r.send(1);
     r.send(2);
     let x = system.with_rt(|rt| rt.block_on(j.join()));
